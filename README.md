@@ -5,6 +5,10 @@
 ![Transport](https://img.shields.io/badge/MCP-HTTP-2f6fed)
 ![Status](https://img.shields.io/badge/status-early%20access-f5a623)
 
+<p align="center">
+  <img src="assets/lunes-mcp-hero.png" alt="Lunes MCP Server secure gateway" width="100%">
+</p>
+
 Secure MCP access to Lunes Network tooling.
 
 Lunes MCP Server is a local-first gateway that exposes Lunes account, transaction,
