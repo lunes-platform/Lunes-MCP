@@ -18,7 +18,9 @@ binding, prepare-only mode, API-key protection for public binds, rate limiting,
 and policy checks before any local signing path is reached.
 
 The current release is ready for local evaluation, agent integration, and
-operator review. It does not yet broadcast final Lunes Network transactions.
+operator review. It does not construct or sign final Lunes Network transactions
+internally; it can relay an externally signed transaction payload only when the
+operator explicitly enables broadcasting.
 
 ## Contents
 
@@ -44,7 +46,7 @@ operator review. It does not yet broadcast final Lunes Network transactions.
 | Authentication | `Authorization: Bearer <token>` or `x-lunes-mcp-api-key: <token>` |
 | Guardrails | allowed extrinsics, destination whitelist, TTL, daily spend limit |
 | Runtime checks | request size limit, response size limit, connection cap, rate limiting |
-| Network status | live metadata, health, native balances, validator set, and archive-assisted transaction lookup; submission is not enabled yet |
+| Network status | live metadata, health, native balances, validator set, archive-assisted transaction lookup, and guarded relay of externally signed payloads |
 
 ### Safety Model
 
@@ -55,6 +57,7 @@ The server is built to fail closed.
 - Empty destination whitelists block all write destinations.
 - Staking tools require the `staking` policy target in the whitelist; validator and reward-account addresses must also be whitelisted.
 - Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1`.
+- Broadcasting a human-signed extrinsic requires explicit local opt-in with `LUNES_MCP_ENABLE_BROADCAST=1` and `confirm_broadcast=true`.
 - Read-only contract simulation requires message-level allowlists; autonomous contract writes remain disabled until asset-specific limits are available.
 
 ## Agent Capabilities
@@ -66,9 +69,11 @@ action passes through explicit server-side policy.
 | Capability | What the agent can do |
 | --- | --- |
 | Account visibility | Read native LUNES balances, nonce, spendable amount, and policy context through live Lunes Network RPC |
+| Asset visibility | List native LUNES plus allowlisted PSP22 contracts, and dry-run token balance reads through live RPC |
 | Network awareness | Read live Lunes Network metadata, health, peers, finality lag, token settings, address format, and runtime version |
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
 | Transaction awareness | Check pending pool, current heads, and the archive endpoint for a transaction hash |
+| Human-signed transaction submission | Broadcast an externally signed Lunes extrinsic and poll for inclusion/finality when explicitly enabled |
 | Validator visibility | Read the current validator set and expose bounded samples to agents |
 | Validator profiles | Inspect active-set status, commission, blocked state, and nomination eligibility hints |
 | Staking account state | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for a Lunes account |
@@ -128,6 +133,22 @@ Expected response shape:
   },
   "id": 1
 }
+```
+
+### Docker
+
+Build the production image locally:
+
+```bash
+docker build -t lunes-mcp-server:local .
+```
+
+Run it with an API key because container deployments bind to all interfaces:
+
+```bash
+docker run --rm -p 9950:9950 \
+  -e LUNES_MCP_API_KEY="$(openssl rand -hex 32)" \
+  lunes-mcp-server:local
 ```
 
 ## Configuration
@@ -200,6 +221,16 @@ export LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1
 Use that flag only for local stub testing. Production autonomous execution needs
 real Lunes Network transaction construction, signing, submission, and finality
 tracking.
+
+Broadcasting an extrinsic already signed by an external wallet is separately
+gated:
+
+```bash
+export LUNES_MCP_ENABLE_BROADCAST=1
+```
+
+Only enable this in an operator-controlled environment. The server does not
+decode or verify the contents of a raw signed payload before submitting it.
 
 ## Client Setup
 
@@ -369,7 +400,9 @@ use a client with HTTP MCP transport support.
 
 | Tool | Type | Description |
 | --- | --- | --- |
-| `lunes_get_balance` | Read | Reads native LUNES balance data through live Lunes Network RPC; PSP22 lookup remains future work |
+| `lunes_get_balance` | Read | Reads native LUNES balance data or delegates allowlisted PSP22 balance checks to the asset balance tool |
+| `lunes_get_assets` | Read | Lists native LUNES and PSP22 contracts currently allowed by the local agent policy |
+| `lunes_get_asset_balance` | Read | Reads native LUNES balances or dry-runs `PSP22::balance_of` for an allowlisted contract |
 | `lunes_get_network_health` | Read | Reads live peer count, sync status, head/finality lag, pending pool size, and RPC surface size |
 | `lunes_get_account_overview` | Read | Reads account nonce, native balances, spendable amount, and active agent policy |
 | `lunes_get_investment_position` | Read | Summarizes liquid and reserved/locked LUNES for staking or treasury planning |
@@ -381,6 +414,7 @@ use a client with HTTP MCP transport support.
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
 | `lunes_get_transaction_status` | Read | Checks pending pool, current heads, and archive endpoint for a transaction hash; `archive_lookback_blocks` can widen the bounded archive search |
+| `lunes_submit_signed_extrinsic` | Write | Broadcasts an externally signed Lunes extrinsic when `LUNES_MCP_ENABLE_BROADCAST=1` and `confirm_broadcast=true`, then polls for inclusion/finality |
 | `lunes_search_account_activity` | Read | Searches pending transactions and recent finalized blocks for account activity |
 | `lunes_read_contract` | Read | Simulates a read-only Lunes contract call through live RPC when allowed by contract message policy |
 | `lunes_search_contract` | Read | Looks up Lunes contract interface metadata |
@@ -396,8 +430,10 @@ use a client with HTTP MCP transport support.
 | `lunes_provision_agent_wallet` | Lifecycle | Creates a local agent key for approval |
 | `lunes_revoke_agent_wallet` | Lifecycle | Revokes the current local agent key |
 
-Write tools are checked against policy before signing. Responses include
-`broadcasted: false` until Lunes Network submission is implemented.
+Write tools are checked against policy before signing. Local intent-signing
+responses still include `broadcasted: false`; `lunes_submit_signed_extrinsic`
+is the separate relay path for payloads that were already signed outside this
+server.
 
 ## Specifications
 
@@ -460,5 +496,5 @@ Key points:
 
 - Keep `LUNES_MCP_API_KEY` out of source control.
 - Do not expose the server publicly without authentication and TLS termination.
-- Treat autonomous signing as experimental until real Lunes Network submission is complete.
+- Treat autonomous signing as experimental until final transaction construction and signing are fully implemented.
 - Review `agent_config.toml` carefully before enabling any write tool.

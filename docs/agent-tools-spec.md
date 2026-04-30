@@ -1,21 +1,24 @@
 # Lunes Agent Tools Specification
 
-This document defines the public contract for the read-only Lunes Network tools
-used by MCP-compatible agents.
+This document defines the public contract for the Lunes Network tools used by
+MCP-compatible agents.
 
 ## Objective
 
 Give agents enough live network context to inspect accounts, reason about
-staking, and prepare investment workflows without receiving unrestricted wallet
-authority.
+staking, prepare investment workflows, and relay human-signed payloads without
+receiving unrestricted wallet authority.
 
 The server must keep the same safety boundary across all tools:
 
 - read tools can query live Lunes Network RPC;
 - write tools can only prepare payloads or sign local intent payloads after
   policy checks;
-- final Lunes Network transaction construction, submission, and finality
-  tracking are not enabled in this release.
+- externally signed transaction payloads can be submitted only when
+  `LUNES_MCP_ENABLE_BROADCAST=1` and the request includes
+  `confirm_broadcast=true`;
+- final Lunes Network transaction construction and signing are not enabled in
+  this release.
 
 ## Commands
 
@@ -40,6 +43,8 @@ curl -s http://127.0.0.1:9964 \
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
+| `lunes_get_assets` | Read | List native LUNES and PSP22 contracts exposed by the active agent policy |
+| `lunes_get_asset_balance` | Read | Read native LUNES or dry-run PSP22 balance reads for allowlisted token contracts |
 | `lunes_get_network_health` | Read | Inspect live peer count, sync status, best/finalized blocks, pending pool size, and RPC surface size |
 | `lunes_get_account_overview` | Read | Inspect account nonce, native LUNES balances, spendable amount, and active agent policy |
 | `lunes_get_investment_position` | Read | Summarize liquid and reserved/locked LUNES for staking or treasury planning |
@@ -48,6 +53,7 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_get_staking_overview` | Read | Summarize validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_staking_account` | Read | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for one Lunes account |
 | `lunes_search_account_activity` | Read | Search pending transactions and recent finalized blocks for bounded account activity |
+| `lunes_submit_signed_extrinsic` | Write | Relay an externally signed Lunes transaction payload, then poll for inclusion/finality |
 | `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
 
 ## Project Structure
@@ -95,22 +101,27 @@ Always:
 
 - validate SS58 addresses before account-specific reads;
 - keep read-only tools free of signing or budget mutation;
+- require contract/message allowlists before PSP22 balance dry-runs;
 - cap user-controlled limits such as validator list size and archive lookup
   depth;
-- keep write tools behind allowlists, TTL, and daily spend limits.
+- keep write tools behind allowlists, TTL, and daily spend limits;
+- require both `LUNES_MCP_ENABLE_BROADCAST=1` and `confirm_broadcast=true`
+  before relaying an externally signed payload.
 
 Ask first:
 
 - adding dependencies;
 - changing public tool names or response fields;
-- enabling final Lunes Network transaction submission;
+- enabling internal final Lunes Network transaction construction or signing;
 - expanding staking reads into reward payout history, performance scoring, or
   automated validator selection.
 
 Never:
 
 - commit private keys, API keys, mnemonics, or production configs;
-- broadcast transactions from these read-only tools;
+- broadcast transactions from read-only tools;
+- construct or sign final network transactions from the local KMS until an
+  audited transaction builder exists;
 - let an agent pick validators outside the configured whitelist for write
   operations.
 
@@ -120,6 +131,9 @@ Never:
 - `lunes_get_network_health` reads live Lunes Network status.
 - `lunes_get_account_overview` returns balance and nonce for a valid Lunes
   address.
+- `lunes_get_assets` exposes only native LUNES plus contracts from local policy.
+- `lunes_get_asset_balance` rejects non-allowlisted PSP22 contracts and returns
+  raw live dry-run results for allowed token balances.
 - `lunes_get_investment_position` gives agents a conservative liquidity and
   policy summary.
 - `lunes_get_validator_set` reads validator addresses from live network state.
@@ -131,5 +145,8 @@ Never:
   chunks, for bonded, nominator, validator, and idle accounts without signing
   or broadcasting.
 - `lunes_search_account_activity` caps account activity scans.
+- `lunes_submit_signed_extrinsic` rejects calls without explicit confirmation
+  and broadcast opt-in, and returns hash, status, block details, and raw event
+  storage for accepted payloads when the network exposes them.
 - `lunes_read_contract` requires contract message allowlists before live reads.
 - All verification commands pass before publishing.

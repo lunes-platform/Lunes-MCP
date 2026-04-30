@@ -27,6 +27,9 @@ const STAKING_POLICY_DESTINATION: &str = "staking";
 const MAX_NOMINATIONS: usize = 16;
 const DEFAULT_VALIDATOR_LIMIT: usize = 16;
 const MAX_VALIDATOR_LIMIT: usize = 64;
+const BROADCAST_OPT_IN_ENV: &str = "LUNES_MCP_ENABLE_BROADCAST";
+const DEFAULT_SUBMISSION_WAIT_BLOCKS: u64 = 4;
+const MAX_SUBMISSION_WAIT_BLOCKS: u64 = 16;
 
 // --- MCP-compatible response schemas ------------------------------------
 
@@ -131,7 +134,9 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_search_contract" => handle_search_contract(&request.arguments),
         "lunes_validate_address" => handle_validate_address(&request.arguments),
         "lunes_get_permissions" => handle_get_permissions(kms),
+        "lunes_get_assets" => handle_get_assets(kms),
         "lunes_get_balance"
+        | "lunes_get_asset_balance"
         | "lunes_search_account_activity"
         | "lunes_get_transaction_status"
         | "lunes_get_network_health"
@@ -141,6 +146,7 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         | "lunes_get_validator_profiles"
         | "lunes_get_staking_overview"
         | "lunes_get_staking_account"
+        | "lunes_submit_signed_extrinsic"
         | "lunes_read_contract" => {
             McpToolResult::error(-32020, "Tool requires a live Lunes RPC client".into())
         }
@@ -172,7 +178,11 @@ pub async fn dispatch_tool_call_with_chain(
     match request.name.as_str() {
         "lunes_get_chain_info" => handle_get_chain_info(lunes_client).await,
         "lunes_get_network_health" => handle_get_network_health(lunes_client).await,
-        "lunes_get_balance" => handle_get_balance(&request.arguments, lunes_client).await,
+        "lunes_get_assets" => handle_get_assets(kms),
+        "lunes_get_balance" => handle_get_balance(&request.arguments, kms, lunes_client).await,
+        "lunes_get_asset_balance" => {
+            handle_get_asset_balance(&request.arguments, kms, lunes_client).await
+        }
         "lunes_get_account_overview" => {
             handle_get_account_overview(&request.arguments, kms, lunes_client).await
         }
@@ -194,6 +204,9 @@ pub async fn dispatch_tool_call_with_chain(
         "lunes_get_transaction_status" => {
             handle_get_tx_status(&request.arguments, lunes_client).await
         }
+        "lunes_submit_signed_extrinsic" => {
+            handle_submit_signed_extrinsic(&request.arguments, lunes_client).await
+        }
         "lunes_search_account_activity" => {
             handle_search_account_activity(&request.arguments, lunes_client).await
         }
@@ -213,6 +226,26 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "address": { "type": "string", "description": "SS58 address on Lunes Network." },
                     "asset_id": { "type": "string", "description": "PSP22 contract address. Omit for native LUNES." }
+                },
+                "required": ["address"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_assets",
+            "description": "List native LUNES plus PSP22 contracts currently allowed by this agent policy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_asset_balance",
+            "description": "Read native LUNES balance or dry-run PSP22::balance_of for an allowlisted token contract.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Owner SS58 address on Lunes Network." },
+                    "asset_id": { "type": "string", "description": "Use native, LUNES, or an allowlisted PSP22 contract address." }
                 },
                 "required": ["address"]
             }
@@ -325,6 +358,24 @@ pub fn tool_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["tx_hash"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_submit_signed_extrinsic",
+            "description": "Broadcast a human-signed Lunes extrinsic and poll for inclusion/finality. Requires LUNES_MCP_ENABLE_BROADCAST=1 and confirm_broadcast=true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "signed_extrinsic": { "type": "string", "description": "0x-prefixed signed extrinsic bytes produced by an external Lunes wallet." },
+                    "confirm_broadcast": { "type": "boolean", "description": "Must be true to broadcast." },
+                    "wait_blocks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_SUBMISSION_WAIT_BLOCKS,
+                        "description": "Number of polling intervals to wait for inclusion/finality. Defaults to 4."
+                    }
+                },
+                "required": ["signed_extrinsic", "confirm_broadcast"]
             }
         }),
         serde_json::json!({
@@ -563,7 +614,61 @@ fn execute_write_operation(
 // --- Read-only handlers --------------------------------------------------
 
 /// `lunes_get_balance` - reads native or PSP22 balance information.
-async fn handle_get_balance(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+async fn handle_get_balance(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    handle_get_asset_balance(args, kms, lunes_client).await
+}
+
+fn handle_get_assets(kms: &AgentKms) -> McpToolResult {
+    let mut contract_assets: Vec<_> = kms
+        .permissions()
+        .allowlist_contracts
+        .iter()
+        .filter(|(_, methods)| {
+            methods.is_empty()
+                || methods
+                    .iter()
+                    .any(|method| is_psp22_balance_method(method.as_str()))
+        })
+        .map(|(contract_address, methods)| {
+            serde_json::json!({
+                "type": "psp22",
+                "contract_address": contract_address,
+                "interface": "PSP22",
+                "read_methods_allowed": methods,
+                "balance_lookup": "contracts_call_dry_run",
+                "decoded": false,
+            })
+        })
+        .collect();
+    contract_assets.sort_by(|left, right| {
+        left["contract_address"]
+            .as_str()
+            .cmp(&right["contract_address"].as_str())
+    });
+
+    McpToolResult::success(serde_json::json!({
+        "assets": {
+            "native": native_asset_json(),
+            "contracts": contract_assets,
+        },
+        "policy": {
+            "psp22_balance_requires_contract_allowlist": true,
+            "native_daily_limit_lunes": kms.permissions().daily_limit_lunes,
+            "asset_specific_transfer_limits": false,
+        },
+        "lookup": "local_agent_policy",
+    }))
+}
+
+async fn handle_get_asset_balance(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
     let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
     let asset_id = args.get("asset_id").and_then(|v| v.as_str());
 
@@ -572,20 +677,44 @@ async fn handle_get_balance(args: &Value, lunes_client: &LunesClient) -> McpTool
         Err(error) => return error,
     };
 
-    if let Some(asset_id) = asset_id {
+    if let Some(asset_id) = asset_id.filter(|asset_id| !is_native_asset_id(asset_id)) {
         if let Err(error) = validate_address(asset_id, "asset_id") {
             return error;
         }
 
-        return McpToolResult::success(serde_json::json!({
-            "address": address,
-            "asset": {
-                "type": "psp22",
-                "contract_address": asset_id,
-            },
-            "status": "pending_implementation",
-            "note": "PSP22 balance lookup needs contract read support in a future sprint."
-        }));
+        if let Err(error) = validate_psp22_balance_read(kms, asset_id) {
+            return McpToolResult::error(error.error_code(), error.to_string());
+        }
+
+        let selector = AbiRegistry::new()
+            .resolve_selector("PSP22::balance_of")
+            .expect("PSP22 balance selector is registered");
+        let mut input_data = selector.to_vec();
+        input_data.extend_from_slice(&parsed.account_id);
+
+        return match lunes_client
+            .fetch_contract_read(asset_id, address, &input_data)
+            .await
+        {
+            Ok(raw_result) => McpToolResult::success(serde_json::json!({
+                "address": address,
+                "account_id_hex": hex::encode(parsed.account_id),
+                "asset": {
+                    "type": "psp22",
+                    "contract_address": asset_id,
+                    "interface": "PSP22",
+                },
+                "balance": {
+                    "decoded": false,
+                    "raw_result": raw_result,
+                    "note": "Returned exactly as provided by Lunes RPC; token-specific decoding remains explicit future work."
+                },
+                "lookup": "live_lunes_contract_read",
+            })),
+            Err(error) => {
+                McpToolResult::error(-32021, format!("Asset balance read failed: {error}"))
+            }
+        };
     }
 
     match lunes_client.native_balance(parsed.account_id).await {
@@ -978,6 +1107,68 @@ async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpTo
     }
 }
 
+async fn handle_submit_signed_extrinsic(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let signed_extrinsic = args
+        .get("signed_extrinsic")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let confirm_broadcast = args
+        .get("confirm_broadcast")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let wait_blocks = args
+        .get("wait_blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_SUBMISSION_WAIT_BLOCKS);
+
+    if signed_extrinsic.is_empty() {
+        return McpToolResult::error(-32001, "Missing required field: signed_extrinsic".into());
+    }
+    if !confirm_broadcast {
+        return McpToolResult::error(
+            -32011,
+            "confirm_broadcast must be true before broadcasting a signed Lunes extrinsic".into(),
+        );
+    }
+    if !broadcast_enabled() {
+        return McpToolResult::error(
+            -32011,
+            format!("{BROADCAST_OPT_IN_ENV}=1 is required before broadcasting to Lunes Network"),
+        );
+    }
+    if wait_blocks > MAX_SUBMISSION_WAIT_BLOCKS {
+        return McpToolResult::error(
+            -32001,
+            format!("wait_blocks must be <= {MAX_SUBMISSION_WAIT_BLOCKS}"),
+        );
+    }
+
+    match lunes_client
+        .submit_signed_extrinsic(signed_extrinsic, wait_blocks)
+        .await
+    {
+        Ok(submission) => McpToolResult::success(serde_json::json!({
+            "tx_hash": submission.tx_hash,
+            "status": submission.status,
+            "block_hash": submission.block_hash,
+            "block_number": submission.block_number,
+            "extrinsic_index": submission.extrinsic_index,
+            "events": submission.events,
+            "endpoint": submission.endpoint,
+            "wait_blocks": submission.wait_blocks,
+            "broadcasted": submission.broadcasted,
+            "note": "This tool only broadcasts an already-signed extrinsic. It does not construct or sign final Lunes Network transactions."
+        })),
+        Err(LunesClientError::InvalidSignedExtrinsic(message)) => {
+            McpToolResult::error(-32001, message)
+        }
+        Err(LunesClientError::InvalidTransactionHash(message)) => {
+            McpToolResult::error(-32020, message)
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
 async fn handle_search_account_activity(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
     let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
     let lookback_blocks = args
@@ -1007,6 +1198,12 @@ async fn handle_search_account_activity(args: &Value, lunes_client: &LunesClient
         Ok(activity) => McpToolResult::success(activity),
         Err(e) => McpToolResult::error(-32020, format!("Failed to search account activity: {}", e)),
     }
+}
+
+fn broadcast_enabled() -> bool {
+    std::env::var(BROADCAST_OPT_IN_ENV)
+        .map(|value| value == "1")
+        .unwrap_or(false)
 }
 
 /// `lunes_search_contract` - looks up Lunes contract metadata.
@@ -1116,9 +1313,26 @@ fn parse_lunes_address(
 fn native_asset_json() -> Value {
     serde_json::json!({
         "type": "native",
+        "asset_id": "native",
         "symbol": "LUNES",
         "decimals": LUNES_DECIMALS,
     })
+}
+
+fn is_native_asset_id(asset_id: &str) -> bool {
+    asset_id.eq_ignore_ascii_case("native") || asset_id.eq_ignore_ascii_case("lunes")
+}
+
+fn is_psp22_balance_method(method: &str) -> bool {
+    method == "PSP22::balance_of" || method == "balance_of"
+}
+
+fn validate_psp22_balance_read(
+    kms: &AgentKms,
+    contract_address: &str,
+) -> Result<(), crate::kms::KmsError> {
+    kms.validate_contract_call(contract_address, "PSP22::balance_of")
+        .or_else(|_| kms.validate_contract_call(contract_address, "balance_of"))
 }
 
 fn native_balance_json(balance: NativeBalance) -> Value {
@@ -1948,14 +2162,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_balance_leaves_psp22_lookup_for_future_sprint() {
+    async fn get_asset_balance_requires_psp22_allowlist() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
         let client = LunesClient::static_native_balance(NativeBalance::zero());
         let address = lunes_address(1);
         let asset_id = lunes_address(2);
         let response = dispatch_tool_call_with_chain(
             &ToolCallRequest {
-                name: "lunes_get_balance".into(),
+                name: "lunes_get_asset_balance".into(),
                 arguments: serde_json::json!({
                     "address": address,
                     "asset_id": asset_id,
@@ -1966,10 +2180,36 @@ mod tests {
         )
         .await;
 
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("-32011"));
+        assert!(response.content[0].text.contains("whitelist"));
+    }
+
+    #[test]
+    fn get_assets_lists_policy_allowed_contracts() {
+        let contract = lunes_address(2);
+        let mut allowlist_contracts = std::collections::HashMap::new();
+        allowlist_contracts.insert(contract.clone(), vec!["PSP22::balance_of".into()]);
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowlist_contracts,
+                ..permissions()
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_get_assets".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+        );
+
         assert!(!response.is_error);
         let data = response_json(&response);
-        assert_eq!(data["asset"]["type"], "psp22");
-        assert_eq!(data["status"], "pending_implementation");
+        assert_eq!(data["assets"]["native"]["symbol"], "LUNES");
+        assert_eq!(data["assets"]["contracts"][0]["contract_address"], contract);
     }
 
     #[tokio::test]
@@ -2324,6 +2564,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_signed_extrinsic_requires_explicit_confirmation() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_native_balance(NativeBalance::zero());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_submit_signed_extrinsic".into(),
+                arguments: serde_json::json!({
+                    "signed_extrinsic": "0x01020304",
+                    "confirm_broadcast": false
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("confirm_broadcast"));
+    }
+
+    #[tokio::test]
     async fn search_account_activity_rejects_lookback_above_limit() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
         let client = LunesClient::static_native_balance(NativeBalance::zero());
@@ -2584,8 +2846,12 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 29);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
+        assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_assets"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_asset_balance"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_network_health"));
@@ -2620,6 +2886,9 @@ mod tests {
         assert!(tx_tool["inputSchema"]["properties"]
             .get("archive_lookback_blocks")
             .is_some());
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_submit_signed_extrinsic"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_search_account_activity"));

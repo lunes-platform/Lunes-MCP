@@ -22,8 +22,8 @@ archive_url = "wss://ws-archive.lunes.io"
 #   "prepare_only" - prepare unsigned payloads for external review.
 #   "autonomous"   - sign locally after KMS policy checks.
 #
-# Autonomous mode is for local stub testing only until real Lunes Network
-# transaction submission is implemented. It also requires:
+# Autonomous mode is for local stub testing only until final Lunes Network
+# transaction construction and signing are implemented. It also requires:
 #   LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1
 mode = "prepare_only"
 

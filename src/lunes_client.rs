@@ -30,6 +30,7 @@ pub struct LunesClient {
     static_validator_set: Option<ValidatorSet>,
     static_staking_account: Option<StakingAccount>,
     static_validator_profiles: Option<Vec<ValidatorProfile>>,
+    static_submission: Option<SignedExtrinsicSubmission>,
 }
 
 impl LunesClient {
@@ -48,6 +49,7 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: None,
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -64,6 +66,7 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: None,
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -80,6 +83,7 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: None,
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -96,6 +100,7 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: None,
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -112,6 +117,7 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: None,
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -128,6 +134,7 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: None,
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -144,6 +151,7 @@ impl LunesClient {
             static_validator_set: Some(validator_set),
             static_staking_account: None,
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -160,6 +168,7 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: Some(staking_account),
             static_validator_profiles: None,
+            static_submission: None,
         }
     }
 
@@ -176,6 +185,24 @@ impl LunesClient {
             static_validator_set: None,
             static_staking_account: None,
             static_validator_profiles: Some(profiles),
+            static_submission: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_submission(submission: SignedExtrinsicSubmission) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+            static_staking_account: None,
+            static_validator_profiles: None,
+            static_submission: Some(submission),
         }
     }
 
@@ -364,6 +391,27 @@ impl LunesClient {
         }
 
         current_not_found.ok_or_else(|| last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    pub async fn submit_signed_extrinsic(
+        &self,
+        extrinsic_hex: &str,
+        wait_blocks: u64,
+    ) -> Result<SignedExtrinsicSubmission, LunesClientError> {
+        if let Some(submission) = &self.static_submission {
+            return Ok(submission.clone());
+        }
+
+        let extrinsic_hex = normalize_extrinsic_hex(extrinsic_hex)?;
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match submit_signed_extrinsic(endpoint, &extrinsic_hex, wait_blocks).await {
+                Ok(submission) => return Ok(submission),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
     }
 
     pub async fn fetch_account_activity(
@@ -734,6 +782,68 @@ async fn fetch_archive_transaction_status(
     Ok(TransactionStatus::not_found(tx_hash, lookup_scope))
 }
 
+async fn submit_signed_extrinsic(
+    endpoint: &str,
+    extrinsic_hex: &str,
+    wait_blocks: u64,
+) -> Result<SignedExtrinsicSubmission, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let tx_hash: String = rpc_request_params(
+        &client,
+        "author_submitExtrinsic",
+        vec![Value::String(extrinsic_hex.to_string())],
+    )
+    .await?;
+    let tx_hash = normalize_32_byte_hash(&tx_hash)?;
+    let mut status = TransactionStatus::not_found(&tx_hash, "post-submit polling".into());
+    let mut events = None;
+    let attempts = wait_blocks.saturating_add(1);
+
+    for attempt in 0..attempts {
+        status = fetch_transaction_status(endpoint, &tx_hash).await?;
+        if let Some(block_hash) = status.block_hash.as_deref() {
+            events = fetch_block_events_raw(&client, block_hash).await?;
+        }
+        if status.status == TransactionState::Finalized {
+            break;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+        }
+    }
+
+    Ok(SignedExtrinsicSubmission {
+        tx_hash,
+        status: status.status,
+        block_hash: status.block_hash,
+        block_number: status.block_number,
+        extrinsic_index: status.extrinsic_index,
+        events,
+        endpoint: endpoint.to_string(),
+        wait_blocks,
+        broadcasted: true,
+    })
+}
+
+async fn fetch_block_events_raw(
+    client: &WsClient,
+    block_hash: &str,
+) -> Result<Option<BlockEvents>, LunesClientError> {
+    let key = storage_prefix_key("System", "Events");
+    let raw_events: Option<String> = rpc_request_params(
+        client,
+        "state_getStorage",
+        vec![Value::String(key), Value::String(block_hash.to_string())],
+    )
+    .await?;
+
+    Ok(raw_events.map(|raw| BlockEvents {
+        block_hash: block_hash.to_string(),
+        raw_storage: raw,
+        decoded: false,
+    }))
+}
+
 async fn fetch_recent_account_activity(
     endpoint: &str,
     account_id: &[u8; 32],
@@ -1062,6 +1172,26 @@ pub struct ValidatorPrefs {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SignedExtrinsicSubmission {
+    pub tx_hash: String,
+    pub status: TransactionState,
+    pub block_hash: Option<String>,
+    pub block_number: Option<u64>,
+    pub extrinsic_index: Option<usize>,
+    pub events: Option<BlockEvents>,
+    pub endpoint: String,
+    pub wait_blocks: u64,
+    pub broadcasted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlockEvents {
+    pub block_hash: String,
+    pub raw_storage: String,
+    pub decoded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TransactionStatus {
     pub tx_hash: String,
     pub status: TransactionState,
@@ -1247,6 +1377,8 @@ pub enum LunesClientError {
     InvalidRpcResponse(String),
     #[error("invalid transaction hash: {0}")]
     InvalidTransactionHash(String),
+    #[error("invalid signed extrinsic: {0}")]
+    InvalidSignedExtrinsic(String),
 }
 
 fn required_string(value: &Value, key: &str) -> Result<String, LunesClientError> {
@@ -1818,6 +1950,17 @@ fn normalize_32_byte_hash(hash: &str) -> Result<String, LunesClientError> {
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
+fn normalize_extrinsic_hex(extrinsic: &str) -> Result<String, LunesClientError> {
+    let bytes = decode_hex_string(extrinsic).map_err(LunesClientError::InvalidSignedExtrinsic)?;
+    if bytes.is_empty() {
+        return Err(LunesClientError::InvalidSignedExtrinsic(
+            "extrinsic bytes must not be empty".into(),
+        ));
+    }
+
+    Ok(format!("0x{}", hex::encode(bytes)))
+}
+
 fn lunes_payload_hash_hex(payload: &[u8]) -> String {
     format!("0x{}", hex::encode(blake2_hash::<32>(payload)))
 }
@@ -2052,5 +2195,41 @@ mod tests {
         assert_eq!(status.block_hash, Some("0xarchive".into()));
         assert_eq!(status.block_number, Some(100));
         assert!(status.lookup_scope.contains("archive"));
+    }
+
+    #[test]
+    fn normalizes_signed_extrinsic_hex() {
+        assert_eq!(normalize_extrinsic_hex("010203").unwrap(), "0x010203");
+        assert_eq!(normalize_extrinsic_hex("0x010203").unwrap(), "0x010203");
+        assert!(normalize_extrinsic_hex("0x").is_err());
+        assert!(normalize_extrinsic_hex("0x0").is_err());
+    }
+
+    #[tokio::test]
+    async fn returns_static_signed_submission_for_tests() {
+        let submission = SignedExtrinsicSubmission {
+            tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+            status: TransactionState::Finalized,
+            block_hash: Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222".into(),
+            ),
+            block_number: Some(42),
+            extrinsic_index: Some(0),
+            events: Some(BlockEvents {
+                block_hash: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .into(),
+                raw_storage: "0x00".into(),
+                decoded: false,
+            }),
+            endpoint: "memory://lunes".into(),
+            wait_blocks: 0,
+            broadcasted: true,
+        };
+        let client = LunesClient::static_submission(submission.clone());
+
+        assert_eq!(
+            client.submit_signed_extrinsic("0x010203", 0).await.unwrap(),
+            submission
+        );
     }
 }

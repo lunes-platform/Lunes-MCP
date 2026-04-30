@@ -19,6 +19,8 @@ jobs:
         run: cargo check --locked
       - name: Test
         run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Install security tooling

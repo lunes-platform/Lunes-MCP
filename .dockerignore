@@ -1,0 +1,8 @@
+target
+.git
+.github
+.env
+.env.*
+*.log
+audit-logs
+docs
