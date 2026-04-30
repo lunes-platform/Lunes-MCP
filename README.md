@@ -43,7 +43,7 @@ operator review. It does not yet broadcast final Lunes Network transactions.
 | Authentication | `Authorization: Bearer <token>` or `x-lunes-mcp-api-key: <token>` |
 | Guardrails | allowed extrinsics, destination whitelist, TTL, daily spend limit |
 | Runtime checks | request size limit, response size limit, connection cap, rate limiting |
-| Chain status | local intent signing only; Lunes Network submission is not enabled yet |
+| Network status | local intent signing only; Lunes Network submission is not enabled yet |
 
 ### Safety Model
 
@@ -64,12 +64,14 @@ action passes through explicit server-side policy.
 | Capability | What the agent can do |
 | --- | --- |
 | Account visibility | Read LUNES and PSP22 balance information for approved workflows |
+| Network awareness | Read live Lunes Network metadata, token settings, address format, and runtime version |
+| Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
 | Transaction awareness | Check transaction status and return structured information to the user |
 | Contract discovery | Look up ink! contract metadata through the Lunes tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
 | Policy-bounded signing | Sign local intent payloads only when autonomous mode, allowlists, TTL, and spend limits permit it |
-| Operational visibility | Report health, status, active key state, spend usage, and audit entries |
+| Operational visibility | Report health, status, active key state, spend usage, permissions, and audit entries |
 
 The practical result is narrow, auditable agency: an assistant can help prepare,
 explain, and route Lunes Network actions without bypassing human control or the
@@ -78,6 +80,7 @@ configured permission model.
 ## Use Cases
 
 - Wallet operations inside agent tools without exposing private keys to the agent.
+- Address validation and permission checks before an agent proposes an irreversible action.
 - Human-reviewed transfer preparation for support, treasury, or operations teams.
 - Read-only account and transaction assistance in Claude Code, Codex, Cursor, Windsurf, and similar environments.
 - Bounded local automation for test flows where destination, extrinsic, TTL, and spend limits are explicitly configured.
@@ -253,7 +256,7 @@ mcp_servers:
 ```
 
 Hermes exposes MCP tools with a server prefix, for example
-`mcp_lunes_lunes_get_balance`.
+`mcp_lunes_lunes_get_chain_info` or `mcp_lunes_lunes_get_balance`.
 
 ### Windsurf
 
@@ -335,6 +338,9 @@ use a client with HTTP MCP transport support.
 | Tool | Type | Description |
 | --- | --- | --- |
 | `lunes_get_balance` | Read | Reads native LUNES or PSP22 balance data |
+| `lunes_get_chain_info` | Read | Reads live Lunes Network metadata, token settings, address format, and runtime version |
+| `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
+| `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
 | `lunes_get_transaction_status` | Read | Reads transaction status by hash |
 | `lunes_search_contract` | Read | Looks up ink! contract metadata |
 | `lunes_transfer_native` | Write | Prepares or signs a native LUNES transfer |
@@ -344,7 +350,7 @@ use a client with HTTP MCP transport support.
 | `lunes_revoke_agent_wallet` | Lifecycle | Revokes the current local agent key |
 
 Write tools are checked against policy before signing. Responses include
-`broadcasted: false` until chain submission is implemented.
+`broadcasted: false` until Lunes Network submission is implemented.
 
 ## Operations
 
@@ -402,5 +408,5 @@ Key points:
 
 - Keep `LUNES_MCP_API_KEY` out of source control.
 - Do not expose the server publicly without authentication and TLS termination.
-- Treat autonomous signing as experimental until real Lunes chain submission is complete.
+- Treat autonomous signing as experimental until real Lunes Network submission is complete.
 - Review `agent_config.toml` carefully before enabling any write tool.

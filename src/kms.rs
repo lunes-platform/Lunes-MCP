@@ -246,6 +246,14 @@ impl AgentKms {
         self.mode == AgentMode::Autonomous
     }
 
+    pub fn mode(&self) -> &AgentMode {
+        &self.mode
+    }
+
+    pub fn permissions(&self) -> &PermissionsConfig {
+        &self.permissions
+    }
+
     /// Returns whether a non-expired key is provisioned.
     pub fn is_active(&self) -> bool {
         let state = self.state.lock();

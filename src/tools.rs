@@ -13,7 +13,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::address::{validate_lunes_address, LUNES_SS58_PREFIX};
 use crate::kms::AgentKms;
+use crate::lunes_client::LunesClient;
 
 // --- MCP-compatible response schemas ------------------------------------
 
@@ -85,16 +87,8 @@ impl McpToolResult {
 // --- SS58 address validation --------------------------------------------
 
 /// Basic SS58 address validation for Lunes-compatible addresses.
-/// Checks length and base58 characters only.
-/// Checksum validation needs Lunes Network RPC integration.
 fn is_valid_ss58(address: &str) -> bool {
-    if address.len() < 46 || address.len() > 48 {
-        return false;
-    }
-    // Base58 charset: 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
-    address
-        .chars()
-        .all(|c| "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(c))
+    validate_lunes_address(address).is_ok()
 }
 
 /// Validates an SS58 address and maps failures to a tool error.
@@ -109,8 +103,8 @@ fn validate_address(address: &str, field_name: &str) -> Result<(), McpToolResult
         return Err(McpToolResult::error(
             -32001,
             format!(
-                "Invalid SS58 address for '{}': '{}'. Expected 46-48 base58 characters.",
-                field_name, address
+                "Invalid Lunes address for '{}': '{}'. Expected SS58 prefix {} with a valid checksum.",
+                field_name, address, LUNES_SS58_PREFIX
             ),
         ));
     }
@@ -126,6 +120,8 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_get_balance" => handle_get_balance(&request.arguments),
         "lunes_get_transaction_status" => handle_get_tx_status(&request.arguments),
         "lunes_search_contract" => handle_search_contract(&request.arguments),
+        "lunes_validate_address" => handle_validate_address(&request.arguments),
+        "lunes_get_permissions" => handle_get_permissions(kms),
 
         // Write operations that go through the KMS policy checks
         "lunes_transfer_native" => handle_transfer_native(&request.arguments, kms),
@@ -137,6 +133,17 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_revoke_agent_wallet" => handle_revoke_wallet(kms),
 
         _ => McpToolResult::error(-32601, format!("Unknown tool: '{}'", request.name)),
+    }
+}
+
+pub async fn dispatch_tool_call_with_chain(
+    request: &ToolCallRequest,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    match request.name.as_str() {
+        "lunes_get_chain_info" => handle_get_chain_info(lunes_client).await,
+        _ => dispatch_tool_call(request, kms),
     }
 }
 
@@ -175,6 +182,33 @@ pub fn tool_definitions() -> Vec<Value> {
                     "contract_address": { "type": "string", "description": "Contract SS58 address." }
                 },
                 "required": ["contract_address"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_chain_info",
+            "description": "Read live Lunes Network metadata, token settings, address prefix, and runtime information.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_validate_address",
+            "description": "Validate that an address belongs to the Lunes Network SS58 format.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Address to validate." }
+                },
+                "required": ["address"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_permissions",
+            "description": "Summarize what this agent can read, prepare, sign, and never do.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
             }
         }),
         serde_json::json!({
@@ -317,6 +351,113 @@ fn handle_search_contract(args: &Value) -> McpToolResult {
         "contract_address": contract_address,
         "status": "pending_implementation",
         "note": "Will return ABI messages from on-chain metadata"
+    }))
+}
+
+async fn handle_get_chain_info(lunes_client: &LunesClient) -> McpToolResult {
+    match lunes_client.chain_info().await {
+        Ok(info) => McpToolResult::success(serde_json::json!({
+            "summary": format!(
+                "{} uses {} with {} decimals and SS58 prefix {}.",
+                info.chain,
+                info.properties.token_symbol,
+                info.properties.token_decimals,
+                info.properties.ss58_format
+            ),
+            "network": info.chain,
+            "node": {
+                "name": info.node_name,
+                "version": info.node_version,
+                "rpc_endpoint": info.rpc_endpoint,
+            },
+            "token": {
+                "symbol": info.properties.token_symbol,
+                "decimals": info.properties.token_decimals,
+            },
+            "address_format": {
+                "ss58_prefix": info.properties.ss58_format,
+                "expected_lunes_prefix": LUNES_SS58_PREFIX,
+                "matches_lunes": info.properties.ss58_format == LUNES_SS58_PREFIX,
+            },
+            "runtime": {
+                "spec_name": info.runtime.spec_name,
+                "impl_name": info.runtime.impl_name,
+                "spec_version": info.runtime.spec_version,
+                "transaction_version": info.runtime.transaction_version,
+                "state_version": info.runtime.state_version,
+            }
+        })),
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+fn handle_validate_address(args: &Value) -> McpToolResult {
+    let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    if address.is_empty() {
+        return McpToolResult::error(-32001, "Missing required field: address".into());
+    }
+
+    match validate_lunes_address(address) {
+        Ok(parsed) => McpToolResult::success(serde_json::json!({
+            "address": address,
+            "is_valid": true,
+            "network": "Lunes",
+            "ss58_prefix": parsed.ss58_prefix,
+            "account_id_hex": hex::encode(parsed.account_id),
+        })),
+        Err(error) => McpToolResult::success(serde_json::json!({
+            "address": address,
+            "is_valid": false,
+            "network": "Lunes",
+            "expected_ss58_prefix": LUNES_SS58_PREFIX,
+            "reason": error.to_string(),
+        })),
+    }
+}
+
+fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
+    let permissions = kms.permissions();
+    let is_autonomous = kms.is_autonomous();
+    let can_prepare_writes =
+        !permissions.allowed_extrinsics.is_empty() && !permissions.whitelisted_addresses.is_empty();
+
+    let signing_status = if is_autonomous {
+        "local intent signing is enabled after policy checks"
+    } else {
+        "local signing is disabled; write tools return human approval payloads"
+    };
+
+    McpToolResult::success(serde_json::json!({
+        "summary": if is_autonomous {
+            "Agent is in autonomous mode, but every write still requires allowlists, TTL, and spend limits."
+        } else {
+            "Agent is in prepare-only mode. It can help prepare actions, but cannot sign or broadcast."
+        },
+        "mode": format!("{:?}", kms.mode()),
+        "kms_active": kms.is_active(),
+        "capabilities": {
+            "can_read": true,
+            "can_validate_lunes_addresses": true,
+            "can_prepare_writes": can_prepare_writes,
+            "can_sign_local_intents": is_autonomous && kms.is_active(),
+            "can_broadcast_to_lunes_network": false,
+        },
+        "policy": {
+            "allowed_extrinsics": permissions.allowed_extrinsics,
+            "whitelisted_addresses": permissions.whitelisted_addresses,
+            "daily_limit_lunes": permissions.daily_limit_lunes,
+            "spent_today_lunes": kms.spent_today(),
+            "remaining_today_lunes": permissions.daily_limit_lunes.saturating_sub(kms.spent_today()),
+            "ttl_hours": permissions.ttl_hours,
+        },
+        "guardrails": [
+            "public HTTP bind requires API key and rate limit",
+            "empty extrinsic allowlist blocks all write tools",
+            "empty destination whitelist blocks all write destinations",
+            "generic contract calls are blocked in autonomous mode until message allowlists exist",
+            "broadcast to Lunes Network is not enabled in this release"
+        ],
+        "signing_status": signing_status,
     }))
 }
 
@@ -497,15 +638,25 @@ fn handle_revoke_wallet(kms: &AgentKms) -> McpToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::encode_lunes_address_for_tests;
     use crate::config::{AgentMode, PermissionsConfig};
+    use crate::lunes_client::{ChainInfo, ChainProperties, RuntimeInfo};
+
+    fn lunes_address(seed: u8) -> String {
+        encode_lunes_address_for_tests([seed; 32])
+    }
 
     fn permissions() -> PermissionsConfig {
         PermissionsConfig {
             allowed_extrinsics: vec!["balances.transfer".into(), "contracts.call".into()],
-            whitelisted_addresses: vec!["5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into()],
+            whitelisted_addresses: vec![lunes_address(1)],
             daily_limit_lunes: 100,
             ttl_hours: 168,
         }
+    }
+
+    fn response_json(response: &McpToolResult) -> serde_json::Value {
+        serde_json::from_str(&response.content[0].text).expect("tool response text is JSON")
     }
 
     #[test]
@@ -550,11 +701,11 @@ mod tests {
     #[test]
     fn get_balance_with_valid_address_succeeds() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
-        // Valid SS58 format (48 chars, base58)
+        let address = lunes_address(1);
         let response = dispatch_tool_call(
             &ToolCallRequest {
                 name: "lunes_get_balance".into(),
-                arguments: serde_json::json!({"address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"}),
+                arguments: serde_json::json!({"address": address}),
             },
             &kms,
         );
@@ -562,13 +713,113 @@ mod tests {
     }
 
     #[test]
+    fn validate_address_reports_lunes_prefix_and_account_id() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let address = lunes_address(7);
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_validate_address".into(),
+                arguments: serde_json::json!({ "address": address }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["is_valid"], true);
+        assert_eq!(data["ss58_prefix"], 57);
+        assert_eq!(data["account_id_hex"], hex::encode([7u8; 32]));
+    }
+
+    #[test]
+    fn validate_address_returns_false_for_wrong_network_prefix() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_validate_address".into(),
+                arguments: serde_json::json!({
+                    "address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["is_valid"], false);
+        assert_eq!(data["expected_ss58_prefix"], 57);
+    }
+
+    #[test]
+    fn get_permissions_summarizes_prepare_only_capabilities() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_get_permissions".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["capabilities"]["can_read"], true);
+        assert_eq!(data["capabilities"]["can_sign_local_intents"], false);
+        assert_eq!(
+            data["capabilities"]["can_broadcast_to_lunes_network"],
+            false
+        );
+        assert_eq!(data["policy"]["daily_limit_lunes"], 100);
+    }
+
+    #[tokio::test]
+    async fn get_chain_info_returns_static_lunes_rpc_metadata() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_info(ChainInfo {
+            rpc_endpoint: "wss://ws.lunes.io".into(),
+            chain: "Lunes Nigthly".into(),
+            node_name: "Lunes Nightly".into(),
+            node_version: "4.0.0-dev".into(),
+            properties: ChainProperties {
+                ss58_format: 57,
+                token_decimals: 8,
+                token_symbol: "LUNES".into(),
+            },
+            runtime: RuntimeInfo {
+                spec_name: "lunes-nightly".into(),
+                impl_name: "lunes-nightly".into(),
+                spec_version: 107,
+                transaction_version: 2,
+                state_version: 2,
+            },
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_chain_info".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["token"]["symbol"], "LUNES");
+        assert_eq!(data["address_format"]["ss58_prefix"], 57);
+        assert_eq!(data["runtime"]["spec_version"], 107);
+    }
+
+    #[test]
     fn prepare_only_native_transfer_waits_for_human_approval() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let to = lunes_address(1);
         let response = dispatch_tool_call(
             &ToolCallRequest {
                 name: "lunes_transfer_native".into(),
                 arguments: serde_json::json!({
-                    "to": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                    "to": to,
                     "amount": 10
                 }),
             },
@@ -584,12 +835,13 @@ mod tests {
     fn autonomous_native_transfer_signs_locally() {
         let kms = AgentKms::new(AgentMode::Autonomous, permissions());
         kms.provision_key().unwrap();
+        let to = lunes_address(1);
 
         let response = dispatch_tool_call(
             &ToolCallRequest {
                 name: "lunes_transfer_native".into(),
                 arguments: serde_json::json!({
-                    "to": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                    "to": to,
                     "amount": 10
                 }),
             },
@@ -604,13 +856,13 @@ mod tests {
 
     #[test]
     fn psp22_transfer_consumes_daily_budget() {
-        let contract = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-        let to = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspK4vJC9Lky3UYGJ";
+        let contract = lunes_address(2);
+        let to = lunes_address(3);
         let kms = AgentKms::new(
             AgentMode::Autonomous,
             PermissionsConfig {
                 allowed_extrinsics: vec!["contracts.call".into()],
-                whitelisted_addresses: vec![contract.into()],
+                whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 5,
                 ttl_hours: 168,
             },
@@ -674,8 +926,14 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 11);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_chain_info"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_permissions"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_transfer_native"));
@@ -705,15 +963,11 @@ mod tests {
 
     #[test]
     fn ss58_validation_works() {
-        // Valid SS58 address (Polkadot format, 48 chars)
-        assert!(is_valid_ss58(
-            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-        ));
+        assert!(is_valid_ss58(&lunes_address(4)));
         // Too short
         assert!(!is_valid_ss58("5Gxyz"));
-        // Contains invalid chars (0, O, I, l are not in base58)
         assert!(!is_valid_ss58(
-            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcN0HGKutQY"
+            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
         ));
     }
 }

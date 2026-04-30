@@ -4,6 +4,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::{Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,10 +13,12 @@ struct RunningServer {
     child: Child,
     addr: String,
     workdir: PathBuf,
+    _test_guard: MutexGuard<'static, ()>,
 }
 
 impl RunningServer {
     fn start(api_key: Option<&str>, rate_per_second: u64, rate_burst: u32) -> Self {
+        let test_guard = server_test_lock().lock().expect("server test lock");
         let port = unused_port();
         let addr = format!("127.0.0.1:{port}");
         let workdir = create_workdir(rate_per_second, rate_burst);
@@ -39,6 +42,7 @@ impl RunningServer {
             child,
             addr,
             workdir,
+            _test_guard: test_guard,
         }
     }
 }
@@ -141,6 +145,11 @@ fn wait_for_tcp(addr: &str, child: &mut Child) {
 fn unused_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("read local addr").port()
+}
+
+fn server_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn create_workdir(rate_per_second: u64, rate_burst: u32) -> PathBuf {

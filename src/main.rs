@@ -4,8 +4,10 @@
 //! It loads the agent configuration, initializes the KMS, registers RPC
 //! methods, and applies policy and transport guardrails before handling calls.
 
+mod address;
 mod config;
 mod kms;
+mod lunes_client;
 mod security;
 mod tools;
 
@@ -19,11 +21,12 @@ use crate::config::{
     default_safe_config, load_config, validate_runtime_config, AgentMode, AUTONOMOUS_STUB_ENV_VAR,
 };
 use crate::kms::AgentKms;
+use crate::lunes_client::LunesClient;
 use crate::security::{
     validate_public_exposure, RateLimitSettings, TransportSecurityLayer, TransportSecurityState,
     API_KEY_ENV_VAR,
 };
-use crate::tools::{dispatch_tool_call, tool_definitions, ToolCallRequest};
+use crate::tools::{dispatch_tool_call_with_chain, tool_definitions, ToolCallRequest};
 
 const MAX_REQUEST_BODY_BYTES: u32 = 64 * 1024;
 const MAX_RESPONSE_BODY_BYTES: u32 = 256 * 1024;
@@ -33,6 +36,7 @@ const MAX_CONNECTIONS: u32 = 64;
 
 struct McpContext {
     kms: AgentKms,
+    lunes_client: LunesClient,
     config_mode: AgentMode,
     rpc_url: String,
     rpc_failover_count: usize,
@@ -121,9 +125,11 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("Refusing unsafe public bind on {addr}"))?;
 
     // 2. Initialize the KMS.
+    let lunes_client = LunesClient::new(rpc_url.clone(), config_file.network.rpc_failovers.clone());
     let kms = AgentKms::new(config_file.agent.wallet.mode, config_file.agent.permissions);
     let ctx = Arc::new(McpContext {
         kms,
+        lunes_client,
         config_mode: mode.clone(),
         rpc_url: rpc_url.clone(),
         rpc_failover_count,
@@ -175,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     // Endpoint: tools/call
-    module.register_method("tools/call", |params, ctx, _| {
+    module.register_async_method("tools/call", |params, ctx, _| async move {
         let request: ToolCallRequest = match params.parse() {
             Ok(r) => r,
             Err(e) => {
@@ -188,12 +194,12 @@ async fn main() -> anyhow::Result<()> {
         };
 
         info!(tool = %request.name, "Processing tool call");
-        let response = dispatch_tool_call(&request, &ctx.kms);
+        let response = dispatch_tool_call_with_chain(&request, &ctx.kms, &ctx.lunes_client).await;
         serde_json::to_value(&response).unwrap_or_default()
     })?;
 
     // Endpoint: mcp_execute_agent_tx
-    module.register_method("mcp_execute_agent_tx", |params, ctx, _| {
+    module.register_async_method("mcp_execute_agent_tx", |params, ctx, _| async move {
         let request: ToolCallRequest = match params.parse() {
             Ok(r) => r,
             Err(e) => {
@@ -206,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         info!(tool = %request.name, "Executing autonomous agent transaction");
-        let response = dispatch_tool_call(&request, &ctx.kms);
+        let response = dispatch_tool_call_with_chain(&request, &ctx.kms, &ctx.lunes_client).await;
         serde_json::to_value(&response).unwrap_or_default()
     })?;
 
