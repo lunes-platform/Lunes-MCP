@@ -15,7 +15,10 @@ use serde_json::Value;
 
 use crate::address::{validate_lunes_address, LUNES_SS58_PREFIX};
 use crate::kms::AgentKms;
-use crate::lunes_client::LunesClient;
+use crate::lunes_client::{LunesClient, LunesClientError, NativeBalance};
+
+const LUNES_DECIMALS: u32 = 8;
+const LUNES_BASE_UNITS: u128 = 100_000_000;
 
 // --- MCP-compatible response schemas ------------------------------------
 
@@ -116,12 +119,13 @@ fn validate_address(address: &str, field_name: &str) -> Result<(), McpToolResult
 /// Routes a tool call name to the matching handler.
 pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolResult {
     match request.name.as_str() {
-        // Read-only queries
-        "lunes_get_balance" => handle_get_balance(&request.arguments),
-        "lunes_get_transaction_status" => handle_get_tx_status(&request.arguments),
+        // Read-only queries that do not need live RPC
         "lunes_search_contract" => handle_search_contract(&request.arguments),
         "lunes_validate_address" => handle_validate_address(&request.arguments),
         "lunes_get_permissions" => handle_get_permissions(kms),
+        "lunes_get_balance" | "lunes_get_transaction_status" => {
+            McpToolResult::error(-32020, "Tool requires a live Lunes RPC client".into())
+        }
 
         // Write operations that go through the KMS policy checks
         "lunes_transfer_native" => handle_transfer_native(&request.arguments, kms),
@@ -143,6 +147,10 @@ pub async fn dispatch_tool_call_with_chain(
 ) -> McpToolResult {
     match request.name.as_str() {
         "lunes_get_chain_info" => handle_get_chain_info(lunes_client).await,
+        "lunes_get_balance" => handle_get_balance(&request.arguments, lunes_client).await,
+        "lunes_get_transaction_status" => {
+            handle_get_tx_status(&request.arguments, lunes_client).await
+        }
         _ => dispatch_tool_call(request, kms),
     }
 }
@@ -301,38 +309,60 @@ fn execute_write_operation(
 // --- Read-only handlers --------------------------------------------------
 
 /// `lunes_get_balance` - reads native or PSP22 balance information.
-fn handle_get_balance(args: &Value) -> McpToolResult {
+async fn handle_get_balance(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
     let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
     let asset_id = args.get("asset_id").and_then(|v| v.as_str());
 
-    if let Err(e) = validate_address(address, "address") {
-        return e;
+    let parsed = match parse_lunes_address(address, "address") {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+
+    if let Some(asset_id) = asset_id {
+        if let Err(error) = validate_address(asset_id, "asset_id") {
+            return error;
+        }
+
+        return McpToolResult::success(serde_json::json!({
+            "address": address,
+            "asset": {
+                "type": "psp22",
+                "contract_address": asset_id,
+            },
+            "status": "pending_implementation",
+            "note": "PSP22 balance lookup needs contract read support in a future sprint."
+        }));
     }
 
-    // TODO: connect to Lunes Network RPC.
-    McpToolResult::success(serde_json::json!({
-        "address": address,
-        "asset": asset_id.unwrap_or("LUNES (native)"),
-        "free_balance": "0",
-        "reserved_balance": "0",
-        "note": "Lunes Network RPC integration pending"
-    }))
+    match lunes_client.native_balance(parsed.account_id).await {
+        Ok(balance) => native_balance_response(address, balance),
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
 }
 
 /// `lunes_get_transaction_status` - reads transaction status by hash.
-fn handle_get_tx_status(args: &Value) -> McpToolResult {
+async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
     let tx_hash = args.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("");
 
     if tx_hash.is_empty() {
         return McpToolResult::error(-32001, "Missing required field: tx_hash".into());
     }
 
-    // TODO: connect to Lunes Network RPC.
-    McpToolResult::success(serde_json::json!({
-        "tx_hash": tx_hash,
-        "status": "pending_implementation",
-        "note": "Will decode block events into human-readable format"
-    }))
+    match lunes_client.transaction_status(tx_hash).await {
+        Ok(status) => McpToolResult::success(serde_json::json!({
+            "tx_hash": status.tx_hash,
+            "status": status.status,
+            "block_hash": status.block_hash,
+            "block_number": status.block_number,
+            "extrinsic_index": status.extrinsic_index,
+            "lookup_scope": status.lookup_scope,
+            "note": "Public RPC lookup is limited to pending pool, current best block, and finalized head."
+        })),
+        Err(LunesClientError::InvalidTransactionHash(message)) => {
+            McpToolResult::error(-32001, message)
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
 }
 
 /// `lunes_search_contract` - looks up ink! contract metadata.
@@ -413,6 +443,70 @@ fn handle_validate_address(args: &Value) -> McpToolResult {
             "reason": error.to_string(),
         })),
     }
+}
+
+fn parse_lunes_address(
+    address: &str,
+    field_name: &str,
+) -> Result<crate::address::LunesAddress, McpToolResult> {
+    if address.is_empty() {
+        return Err(McpToolResult::error(
+            -32001,
+            format!("Missing required field: {}", field_name),
+        ));
+    }
+
+    validate_lunes_address(address).map_err(|_| {
+        McpToolResult::error(
+            -32001,
+            format!(
+                "Invalid Lunes address for '{}': '{}'. Expected SS58 prefix {} with a valid checksum.",
+                field_name, address, LUNES_SS58_PREFIX
+            ),
+        )
+    })
+}
+
+fn native_balance_response(address: &str, balance: NativeBalance) -> McpToolResult {
+    let spendable = balance.free.saturating_sub(balance.frozen);
+
+    McpToolResult::success(serde_json::json!({
+        "address": address,
+        "asset": {
+            "type": "native",
+            "symbol": "LUNES",
+            "decimals": LUNES_DECIMALS,
+        },
+        "free_balance": balance.free.to_string(),
+        "reserved_balance": balance.reserved.to_string(),
+        "frozen_balance": balance.frozen.to_string(),
+        "spendable_balance": spendable.to_string(),
+        "balances": {
+            "free_base_units": balance.free.to_string(),
+            "reserved_base_units": balance.reserved.to_string(),
+            "frozen_base_units": balance.frozen.to_string(),
+            "spendable_base_units": spendable.to_string(),
+            "free_lunes": format_lunes_amount(balance.free),
+            "reserved_lunes": format_lunes_amount(balance.reserved),
+            "frozen_lunes": format_lunes_amount(balance.frozen),
+            "spendable_lunes": format_lunes_amount(spendable),
+        },
+        "lookup": "live_lunes_rpc",
+    }))
+}
+
+fn format_lunes_amount(value: u128) -> String {
+    let whole = value / LUNES_BASE_UNITS;
+    let fractional = value % LUNES_BASE_UNITS;
+
+    if fractional == 0 {
+        return whole.to_string();
+    }
+
+    let fractional = format!("{:08}", fractional)
+        .trim_end_matches('0')
+        .to_string();
+    format!("{whole}.{fractional}")
 }
 
 fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
@@ -640,7 +734,9 @@ mod tests {
     use super::*;
     use crate::address::encode_lunes_address_for_tests;
     use crate::config::{AgentMode, PermissionsConfig};
-    use crate::lunes_client::{ChainInfo, ChainProperties, RuntimeInfo};
+    use crate::lunes_client::{
+        ChainInfo, ChainProperties, NativeBalance, RuntimeInfo, TransactionState, TransactionStatus,
+    };
 
     fn lunes_address(seed: u8) -> String {
         encode_lunes_address_for_tests([seed; 32])
@@ -673,43 +769,142 @@ mod tests {
         assert!(response.is_error);
     }
 
-    #[test]
-    fn get_balance_requires_valid_address() {
+    #[tokio::test]
+    async fn get_balance_requires_valid_address() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_native_balance(NativeBalance::zero());
 
         // Empty address
-        let response = dispatch_tool_call(
+        let response = dispatch_tool_call_with_chain(
             &ToolCallRequest {
                 name: "lunes_get_balance".into(),
                 arguments: serde_json::json!({}),
             },
             &kms,
-        );
+            &client,
+        )
+        .await;
         assert!(response.is_error);
 
         // Invalid SS58 (too short)
-        let response = dispatch_tool_call(
+        let response = dispatch_tool_call_with_chain(
             &ToolCallRequest {
                 name: "lunes_get_balance".into(),
                 arguments: serde_json::json!({"address": "abc"}),
             },
             &kms,
-        );
+            &client,
+        )
+        .await;
         assert!(response.is_error);
     }
 
-    #[test]
-    fn get_balance_with_valid_address_succeeds() {
+    #[tokio::test]
+    async fn get_balance_with_valid_address_succeeds() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_native_balance(NativeBalance {
+            free: 1_250_000_000,
+            reserved: 200_000_000,
+            frozen: 50_000_000,
+            flags: 0,
+        });
         let address = lunes_address(1);
-        let response = dispatch_tool_call(
+        let response = dispatch_tool_call_with_chain(
             &ToolCallRequest {
                 name: "lunes_get_balance".into(),
                 arguments: serde_json::json!({"address": address}),
             },
             &kms,
-        );
+            &client,
+        )
+        .await;
+
         assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["asset"]["symbol"], "LUNES");
+        assert_eq!(data["free_balance"], "1250000000");
+        assert_eq!(data["balances"]["free_lunes"], "12.5");
+        assert_eq!(data["balances"]["spendable_lunes"], "12");
+    }
+
+    #[tokio::test]
+    async fn get_balance_leaves_psp22_lookup_for_future_sprint() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_native_balance(NativeBalance::zero());
+        let address = lunes_address(1);
+        let asset_id = lunes_address(2);
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_balance".into(),
+                arguments: serde_json::json!({
+                    "address": address,
+                    "asset_id": asset_id,
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["asset"]["type"], "psp22");
+        assert_eq!(data["status"], "pending_implementation");
+    }
+
+    #[tokio::test]
+    async fn get_transaction_status_returns_network_status() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_transaction_status(TransactionStatus {
+            tx_hash: format!("0x{}", "11".repeat(32)),
+            status: TransactionState::Finalized,
+            block_hash: Some(format!("0x{}", "22".repeat(32))),
+            block_number: Some(42),
+            extrinsic_index: Some(3),
+            lookup_scope: "test scope".into(),
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_transaction_status".into(),
+                arguments: serde_json::json!({ "tx_hash": format!("0x{}", "11".repeat(32)) }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["status"], "finalized");
+        assert_eq!(data["block_number"], 42);
+        assert_eq!(data["extrinsic_index"], 3);
+    }
+
+    #[tokio::test]
+    async fn get_transaction_status_rejects_invalid_hash() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_transaction_status(TransactionStatus {
+            tx_hash: format!("0x{}", "11".repeat(32)),
+            status: TransactionState::NotFound,
+            block_hash: None,
+            block_number: None,
+            extrinsic_index: None,
+            lookup_scope: "test scope".into(),
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_transaction_status".into(),
+                arguments: serde_json::json!({ "tx_hash": "0x1234" }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("expected 32 bytes"));
     }
 
     #[test]

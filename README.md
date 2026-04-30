@@ -43,7 +43,7 @@ operator review. It does not yet broadcast final Lunes Network transactions.
 | Authentication | `Authorization: Bearer <token>` or `x-lunes-mcp-api-key: <token>` |
 | Guardrails | allowed extrinsics, destination whitelist, TTL, daily spend limit |
 | Runtime checks | request size limit, response size limit, connection cap, rate limiting |
-| Network status | local intent signing only; Lunes Network submission is not enabled yet |
+| Network status | live metadata, native balance reads, and limited transaction lookup; submission is not enabled yet |
 
 ### Safety Model
 
@@ -63,10 +63,10 @@ action passes through explicit server-side policy.
 
 | Capability | What the agent can do |
 | --- | --- |
-| Account visibility | Read LUNES and PSP22 balance information for approved workflows |
+| Account visibility | Read native LUNES balances through live Lunes Network RPC |
 | Network awareness | Read live Lunes Network metadata, token settings, address format, and runtime version |
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
-| Transaction awareness | Check transaction status and return structured information to the user |
+| Transaction awareness | Check pending pool, current best block, and finalized head for a transaction hash |
 | Contract discovery | Look up ink! contract metadata through the Lunes tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
@@ -337,11 +337,11 @@ use a client with HTTP MCP transport support.
 
 | Tool | Type | Description |
 | --- | --- | --- |
-| `lunes_get_balance` | Read | Reads native LUNES or PSP22 balance data |
+| `lunes_get_balance` | Read | Reads native LUNES balance data through live Lunes Network RPC; PSP22 lookup remains future work |
 | `lunes_get_chain_info` | Read | Reads live Lunes Network metadata, token settings, address format, and runtime version |
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
-| `lunes_get_transaction_status` | Read | Reads transaction status by hash |
+| `lunes_get_transaction_status` | Read | Checks pending pool, current best block, and finalized head for a transaction hash |
 | `lunes_search_contract` | Read | Looks up ink! contract metadata |
 | `lunes_transfer_native` | Write | Prepares or signs a native LUNES transfer |
 | `lunes_transfer_psp22` | Write | Prepares or signs a PSP22 transfer |
