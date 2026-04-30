@@ -1,0 +1,32 @@
+/target
+
+# Internal planning documents
+docs/
+PRD.md
+PDR.md
+SPEC.md
+spec.md
+specs/
+prd/
+planning/
+roadmap-internal.md
+
+# Local secrets and deployment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.seed
+*.secret
+
+# Runtime artifacts
+*.log
+audit.log
+agent_config.local.toml
+agent_config.prod.toml
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/

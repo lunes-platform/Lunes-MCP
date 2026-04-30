@@ -1,0 +1,51 @@
+# Lunes MCP Server configuration
+#
+# This file defines the agent operating mode, write permissions, spending
+# limits, and HTTP server settings. The default configuration is intentionally
+# safe: it can prepare payloads for review, but it cannot sign or spend.
+
+[network]
+# Primary Lunes Network WebSocket endpoint.
+rpc_url = "wss://ws.lunes.io"
+
+# Fallback WebSocket endpoints.
+rpc_failovers = [
+    "wss://ws-lunes-main-01.lunes.io",
+    "wss://ws-lunes-main-02.lunes.io"
+]
+
+# Archive endpoint for historical queries.
+archive_url = "wss://ws-archive.lunes.io"
+
+[agent.wallet]
+# Available modes:
+#   "prepare_only" - prepare unsigned payloads for external review.
+#   "autonomous"   - sign locally after KMS policy checks.
+#
+# Autonomous mode is for local stub testing only until real Substrate
+# transaction submission is implemented. It also requires:
+#   LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1
+mode = "prepare_only"
+
+[agent.permissions]
+# Extrinsics the agent may invoke. Empty means no write operation is allowed.
+allowed_extrinsics = []
+
+# Destination addresses or contracts the agent may write to.
+# Empty means no write destination is allowed.
+whitelisted_addresses = []
+
+# Maximum LUNES spend over a 24-hour window.
+# Zero blocks autonomous spend and native transfer preparation.
+daily_limit_lunes = 0
+
+# Agent key lifetime in hours. Zero disables expiration.
+ttl_hours = 168
+
+[server]
+# Keep localhost by default. For containers, use 0.0.0.0 only with
+# LUNES_MCP_API_KEY set to a strong random token.
+bind_address = "127.0.0.1"
+port = 9950
+rate_limit_per_second = 10
+rate_limit_burst = 20

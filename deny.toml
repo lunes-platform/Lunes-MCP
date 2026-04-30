@@ -1,0 +1,33 @@
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "MIT",
+  "Unicode-3.0",
+]
+
+[licenses.private]
+ignore = true
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+skip = [
+  { crate = "toml_datetime@0.6.11", reason = "toml and jsonrpsee currently use different toml parser stacks" },
+  { crate = "toml_edit@0.22.27", reason = "toml and jsonrpsee currently use different toml parser stacks" },
+  { crate = "winnow@0.7.15", reason = "toml and jsonrpsee currently use different parser versions" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
