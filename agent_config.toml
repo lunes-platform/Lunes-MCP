@@ -29,9 +29,11 @@ mode = "prepare_only"
 
 [agent.permissions]
 # Extrinsics the agent may invoke. Empty means no write operation is allowed.
+# Examples: "balances.transfer", "staking.bond", "staking.nominate".
 allowed_extrinsics = []
 
-# Destination addresses or contracts the agent may write to.
+# Destination addresses, contracts, or policy targets the agent may write to.
+# Staking workflows require "staking" plus every validator/reward address.
 # Empty means no write destination is allowed.
 whitelisted_addresses = []
 

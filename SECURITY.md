@@ -32,8 +32,9 @@ The `.gitignore` blocks these patterns by default.
 
 ## Current Security Limitations
 
-- Lunes Network metadata, native balances, and limited transaction lookup use live RPC.
-- PSP22 balance reads, deep historical transaction lookup, and submissions still need full network-backed implementations.
+- Lunes Network metadata, native balances, and bounded archive-assisted transaction lookup use live RPC.
+- PSP22 balance reads, indexed full-history transaction search, and submissions still need full network-backed implementations.
+- Staking tools prepare or locally sign intent payloads only; validator and reward-account choices must be explicitly whitelisted.
 - SS58 validation checks the Lunes Network prefix and checksum, but it does not prove account ownership.
 - Autonomous signatures are local intent payload signatures, not final Lunes Network transaction signatures.
 - Autonomous `contracts.call` is disabled until message allowlists and asset-specific limits exist.

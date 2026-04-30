@@ -15,10 +15,15 @@ use serde_json::Value;
 
 use crate::address::{validate_lunes_address, LUNES_SS58_PREFIX};
 use crate::kms::AgentKms;
-use crate::lunes_client::{LunesClient, LunesClientError, NativeBalance};
+use crate::lunes_client::{
+    LunesClient, LunesClientError, NativeBalance, DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS,
+    MAX_ARCHIVE_TX_LOOKBACK_BLOCKS,
+};
 
 const LUNES_DECIMALS: u32 = 8;
 const LUNES_BASE_UNITS: u128 = 100_000_000;
+const STAKING_POLICY_DESTINATION: &str = "staking";
+const MAX_NOMINATIONS: usize = 16;
 
 // --- MCP-compatible response schemas ------------------------------------
 
@@ -131,6 +136,12 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_transfer_native" => handle_transfer_native(&request.arguments, kms),
         "lunes_transfer_psp22" => handle_transfer_psp22(&request.arguments, kms),
         "lunes_call_contract" => handle_call_contract(&request.arguments, kms),
+        "lunes_stake_bond" => handle_stake_bond(&request.arguments, kms),
+        "lunes_stake_unbond" => handle_stake_unbond(&request.arguments, kms),
+        "lunes_stake_withdraw_unbonded" => handle_stake_withdraw_unbonded(&request.arguments, kms),
+        "lunes_stake_nominate" => handle_stake_nominate(&request.arguments, kms),
+        "lunes_stake_chill" => handle_stake_chill(kms),
+        "lunes_stake_set_payee" => handle_stake_set_payee(&request.arguments, kms),
 
         // Agent wallet lifecycle
         "lunes_provision_agent_wallet" => handle_provision_wallet(kms),
@@ -176,7 +187,13 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tx_hash": { "type": "string", "description": "Hexadecimal transaction hash." }
+                    "tx_hash": { "type": "string", "description": "Hexadecimal transaction hash." },
+                    "archive_lookback_blocks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_ARCHIVE_TX_LOOKBACK_BLOCKS,
+                        "description": "Optional archive search depth. Defaults to a small recent-block window; 0 disables archive fallback."
+                    }
                 },
                 "required": ["tx_hash"]
             }
@@ -256,6 +273,77 @@ pub fn tool_definitions() -> Vec<Value> {
                     "value": { "type": "integer", "minimum": 0, "description": "Native LUNES value to send with the call. Defaults to 0." }
                 },
                 "required": ["contract_address", "message"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_stake_bond",
+            "description": "Prepare or sign a Lunes staking bond operation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount": { "type": "integer", "minimum": 1, "description": "LUNES amount to bond." },
+                    "reward_destination": { "type": "string", "description": "Reward destination: staked, stash, controller, or account. Defaults to staked." },
+                    "reward_account": { "type": "string", "description": "Required when reward_destination is account." }
+                },
+                "required": ["amount"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_stake_unbond",
+            "description": "Prepare or sign a Lunes staking unbond operation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount": { "type": "integer", "minimum": 1, "description": "LUNES amount to unbond." }
+                },
+                "required": ["amount"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_stake_withdraw_unbonded",
+            "description": "Prepare or sign withdrawal of unlocked staking funds.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slashing_spans": { "type": "integer", "minimum": 0, "description": "Slashing spans count. Defaults to 0." }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_stake_nominate",
+            "description": "Prepare or sign validator nomination for Lunes staking.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "validators": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_NOMINATIONS,
+                        "items": { "type": "string" },
+                        "description": "Validator addresses to nominate. Every address must be whitelisted."
+                    }
+                },
+                "required": ["validators"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_stake_chill",
+            "description": "Prepare or sign a pause of active nominations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_stake_set_payee",
+            "description": "Prepare or sign staking reward destination update.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reward_destination": { "type": "string", "description": "Reward destination: staked, stash, controller, or account." },
+                    "reward_account": { "type": "string", "description": "Required when reward_destination is account." }
+                },
+                "required": ["reward_destination"]
             }
         }),
         serde_json::json!({
@@ -343,12 +431,40 @@ async fn handle_get_balance(args: &Value, lunes_client: &LunesClient) -> McpTool
 /// `lunes_get_transaction_status` - reads transaction status by hash.
 async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
     let tx_hash = args.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("");
+    let requested_archive_lookback_blocks =
+        args.get("archive_lookback_blocks").and_then(|v| v.as_u64());
+    let archive_lookback_blocks =
+        requested_archive_lookback_blocks.unwrap_or(DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS);
 
     if tx_hash.is_empty() {
         return McpToolResult::error(-32001, "Missing required field: tx_hash".into());
     }
 
-    match lunes_client.transaction_status(tx_hash).await {
+    if archive_lookback_blocks > MAX_ARCHIVE_TX_LOOKBACK_BLOCKS {
+        return McpToolResult::error(
+            -32001,
+            format!(
+                "archive_lookback_blocks must be <= {}",
+                MAX_ARCHIVE_TX_LOOKBACK_BLOCKS
+            ),
+        );
+    }
+
+    let status_result = if requested_archive_lookback_blocks.is_some() {
+        lunes_client
+            .transaction_status_with_archive_lookback(tx_hash, archive_lookback_blocks)
+            .await
+    } else {
+        lunes_client.transaction_status(tx_hash).await
+    };
+
+    let lookup_note = if archive_lookback_blocks == 0 {
+        "Lookup checks pending pool and current heads; archive fallback was disabled for this request."
+    } else {
+        "Lookup checks pending pool, current heads, and the configured archive endpoint with a bounded recent-block search."
+    };
+
+    match status_result {
         Ok(status) => McpToolResult::success(serde_json::json!({
             "tx_hash": status.tx_hash,
             "status": status.status,
@@ -356,7 +472,8 @@ async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpTo
             "block_number": status.block_number,
             "extrinsic_index": status.extrinsic_index,
             "lookup_scope": status.lookup_scope,
-            "note": "Public RPC lookup is limited to pending pool, current best block, and finalized head."
+            "archive_lookback_blocks": archive_lookback_blocks,
+            "note": lookup_note
         })),
         Err(LunesClientError::InvalidTransactionHash(message)) => {
             McpToolResult::error(-32001, message)
@@ -514,6 +631,10 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
     let is_autonomous = kms.is_autonomous();
     let can_prepare_writes =
         !permissions.allowed_extrinsics.is_empty() && !permissions.whitelisted_addresses.is_empty();
+    let can_manage_staking = permissions
+        .allowed_extrinsics
+        .iter()
+        .any(|extrinsic| extrinsic.starts_with("staking."));
 
     let signing_status = if is_autonomous {
         "local intent signing is enabled after policy checks"
@@ -533,6 +654,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "can_read": true,
             "can_validate_lunes_addresses": true,
             "can_prepare_writes": can_prepare_writes,
+            "can_manage_staking": can_manage_staking,
             "can_sign_local_intents": is_autonomous && kms.is_active(),
             "can_broadcast_to_lunes_network": false,
         },
@@ -548,6 +670,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "public HTTP bind requires API key and rate limit",
             "empty extrinsic allowlist blocks all write tools",
             "empty destination whitelist blocks all write destinations",
+            "staking tools require the staking policy target plus validator or reward accounts in the whitelist",
             "generic contract calls are blocked in autonomous mode until message allowlists exist",
             "broadcast to Lunes Network is not enabled in this release"
         ],
@@ -705,6 +828,314 @@ fn handle_call_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
+/// `lunes_stake_bond` - prepares or signs a staking bond operation.
+fn handle_stake_bond(args: &Value, kms: &AgentKms) -> McpToolResult {
+    let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    if amount == 0 {
+        return McpToolResult::error(-32001, "Missing or zero required field: amount".into());
+    }
+
+    let reward = match reward_destination_from_args(args, true) {
+        Ok(reward) => reward,
+        Err(error) => return error,
+    };
+    if let Some(error) = validate_reward_account_whitelist(kms, &reward) {
+        return error;
+    }
+
+    let payload = format!("staking.bond({amount},{})", reward.payload_value());
+    execute_staking_operation(
+        kms,
+        "staking.bond",
+        amount,
+        &payload,
+        serde_json::json!({
+            "action": "staking.bond",
+            "amount_lunes": amount,
+            "reward_destination": reward.destination,
+            "reward_account": reward.account,
+        }),
+    )
+}
+
+/// `lunes_stake_unbond` - prepares or signs staking unbond.
+fn handle_stake_unbond(args: &Value, kms: &AgentKms) -> McpToolResult {
+    let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    if amount == 0 {
+        return McpToolResult::error(-32001, "Missing or zero required field: amount".into());
+    }
+
+    let payload = format!("staking.unbond({amount})");
+    execute_staking_operation(
+        kms,
+        "staking.unbond",
+        amount,
+        &payload,
+        serde_json::json!({
+            "action": "staking.unbond",
+            "amount_lunes": amount,
+        }),
+    )
+}
+
+/// `lunes_stake_withdraw_unbonded` - prepares or signs unlocked fund withdrawal.
+fn handle_stake_withdraw_unbonded(args: &Value, kms: &AgentKms) -> McpToolResult {
+    let slashing_spans = args
+        .get("slashing_spans")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let payload = format!("staking.withdraw_unbonded({slashing_spans})");
+    execute_staking_operation(
+        kms,
+        "staking.withdraw_unbonded",
+        0,
+        &payload,
+        serde_json::json!({
+            "action": "staking.withdraw_unbonded",
+            "slashing_spans": slashing_spans,
+        }),
+    )
+}
+
+/// `lunes_stake_nominate` - prepares or signs validator nominations.
+fn handle_stake_nominate(args: &Value, kms: &AgentKms) -> McpToolResult {
+    let validators = match string_array(args, "validators") {
+        Ok(validators) => validators,
+        Err(error) => return error,
+    };
+
+    if validators.is_empty() {
+        return McpToolResult::error(-32001, "validators must not be empty".into());
+    }
+    if validators.len() > MAX_NOMINATIONS {
+        return McpToolResult::error(
+            -32001,
+            format!("validators exceeds maximum of {MAX_NOMINATIONS}"),
+        );
+    }
+
+    for validator in &validators {
+        if let Err(error) = validate_address(validator, "validators") {
+            return error;
+        }
+    }
+    if let Some(error) = validate_extra_whitelisted_destinations(kms, &validators) {
+        return error;
+    }
+
+    let payload = format!("staking.nominate({})", validators.join(","));
+    execute_staking_operation(
+        kms,
+        "staking.nominate",
+        0,
+        &payload,
+        serde_json::json!({
+            "action": "staking.nominate",
+            "validators": validators,
+        }),
+    )
+}
+
+/// `lunes_stake_chill` - prepares or signs nomination pause.
+fn handle_stake_chill(kms: &AgentKms) -> McpToolResult {
+    execute_staking_operation(
+        kms,
+        "staking.chill",
+        0,
+        "staking.chill()",
+        serde_json::json!({
+            "action": "staking.chill",
+        }),
+    )
+}
+
+/// `lunes_stake_set_payee` - prepares or signs reward destination update.
+fn handle_stake_set_payee(args: &Value, kms: &AgentKms) -> McpToolResult {
+    let reward = match reward_destination_from_args(args, false) {
+        Ok(reward) => reward,
+        Err(error) => return error,
+    };
+    if let Some(error) = validate_reward_account_whitelist(kms, &reward) {
+        return error;
+    }
+
+    let payload = format!("staking.set_payee({})", reward.payload_value());
+    execute_staking_operation(
+        kms,
+        "staking.set_payee",
+        0,
+        &payload,
+        serde_json::json!({
+            "action": "staking.set_payee",
+            "reward_destination": reward.destination,
+            "reward_account": reward.account,
+        }),
+    )
+}
+
+fn execute_staking_operation(
+    kms: &AgentKms,
+    extrinsic: &str,
+    amount_lunes: u64,
+    payload: &str,
+    data: Value,
+) -> McpToolResult {
+    execute_write_operation(
+        kms,
+        extrinsic,
+        STAKING_POLICY_DESTINATION,
+        amount_lunes,
+        payload,
+        |sig, pk| {
+            let mut data = data.clone();
+            if let Some(object) = data.as_object_mut() {
+                object.insert("signature".into(), Value::String(sig.to_string()));
+                object.insert("signer".into(), Value::String(pk.to_string()));
+                object.insert("broadcasted".into(), Value::Bool(false));
+                object.insert(
+                    "submission_status".into(),
+                    Value::String("not_broadcasted".into()),
+                );
+                object.insert(
+                    "note".into(),
+                    Value::String("Signed locally. Lunes Network broadcast pending.".into()),
+                );
+            }
+            data
+        },
+        {
+            let mut pending = data.clone();
+            if let Some(object) = pending.as_object_mut() {
+                object.insert(
+                    "unsigned_payload".into(),
+                    Value::String(payload.to_string()),
+                );
+                object.insert("broadcasted".into(), Value::Bool(false));
+                object.insert(
+                    "next_step".into(),
+                    Value::String(
+                        "Human must review and sign this staking operation with an external wallet."
+                            .into(),
+                    ),
+                );
+            }
+            pending
+        },
+    )
+}
+
+#[derive(Debug)]
+struct RewardDestination {
+    destination: String,
+    account: Option<String>,
+}
+
+impl RewardDestination {
+    fn payload_value(&self) -> String {
+        match &self.account {
+            Some(account) => format!("{}:{account}", self.destination),
+            None => self.destination.clone(),
+        }
+    }
+}
+
+fn reward_destination_from_args(
+    args: &Value,
+    default_to_staked: bool,
+) -> Result<RewardDestination, McpToolResult> {
+    let destination = args
+        .get("reward_destination")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if default_to_staked { "staked" } else { "" });
+
+    if destination.is_empty() {
+        return Err(McpToolResult::error(
+            -32001,
+            "Missing required field: reward_destination".into(),
+        ));
+    }
+
+    if !matches!(destination, "staked" | "stash" | "controller" | "account") {
+        return Err(McpToolResult::error(
+            -32001,
+            "reward_destination must be staked, stash, controller, or account".into(),
+        ));
+    }
+
+    let account = args
+        .get("reward_account")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    if destination == "account" {
+        let account = account.ok_or_else(|| {
+            McpToolResult::error(
+                -32001,
+                "reward_account is required when reward_destination is account".into(),
+            )
+        })?;
+        validate_address(&account, "reward_account")?;
+        return Ok(RewardDestination {
+            destination: destination.into(),
+            account: Some(account),
+        });
+    }
+
+    Ok(RewardDestination {
+        destination: destination.into(),
+        account: None,
+    })
+}
+
+fn string_array(args: &Value, field_name: &str) -> Result<Vec<String>, McpToolResult> {
+    let values = args
+        .get(field_name)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            McpToolResult::error(-32001, format!("Missing required field: {field_name}"))
+        })?;
+
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                McpToolResult::error(-32001, format!("{field_name} must contain only strings"))
+            })
+        })
+        .collect()
+}
+
+fn validate_reward_account_whitelist(
+    kms: &AgentKms,
+    reward: &RewardDestination,
+) -> Option<McpToolResult> {
+    reward.account.as_ref().and_then(|account| {
+        validate_extra_whitelisted_destinations(kms, std::slice::from_ref(account))
+    })
+}
+
+fn validate_extra_whitelisted_destinations(
+    kms: &AgentKms,
+    destinations: &[String],
+) -> Option<McpToolResult> {
+    let permissions = kms.permissions();
+    for destination in destinations {
+        if !permissions
+            .whitelisted_addresses
+            .iter()
+            .any(|allowed| allowed == destination)
+        {
+            return Some(McpToolResult::error(
+                -32011,
+                format!("Destination '{destination}' is not in the whitelist."),
+            ));
+        }
+    }
+
+    None
+}
+
 /// `lunes_provision_agent_wallet` - creates a local agent key for approval.
 fn handle_provision_wallet(kms: &AgentKms) -> McpToolResult {
     match kms.provision_key() {
@@ -747,6 +1178,22 @@ mod tests {
             allowed_extrinsics: vec!["balances.transfer".into(), "contracts.call".into()],
             whitelisted_addresses: vec![lunes_address(1)],
             daily_limit_lunes: 100,
+            ttl_hours: 168,
+        }
+    }
+
+    fn staking_permissions() -> PermissionsConfig {
+        PermissionsConfig {
+            allowed_extrinsics: vec![
+                "staking.bond".into(),
+                "staking.unbond".into(),
+                "staking.withdraw_unbonded".into(),
+                "staking.nominate".into(),
+                "staking.chill".into(),
+                "staking.set_payee".into(),
+            ],
+            whitelisted_addresses: vec!["staking".into(), lunes_address(8), lunes_address(9)],
+            daily_limit_lunes: 1_000,
             ttl_hours: 168,
         }
     }
@@ -879,6 +1326,10 @@ mod tests {
         assert_eq!(data["status"], "finalized");
         assert_eq!(data["block_number"], 42);
         assert_eq!(data["extrinsic_index"], 3);
+        assert_eq!(
+            data["archive_lookback_blocks"],
+            DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS
+        );
     }
 
     #[tokio::test]
@@ -905,6 +1356,35 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.content[0].text.contains("expected 32 bytes"));
+    }
+
+    #[tokio::test]
+    async fn get_transaction_status_rejects_archive_lookback_above_limit() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_transaction_status(TransactionStatus {
+            tx_hash: format!("0x{}", "11".repeat(32)),
+            status: TransactionState::NotFound,
+            block_hash: None,
+            block_number: None,
+            extrinsic_index: None,
+            lookup_scope: "test scope".into(),
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_transaction_status".into(),
+                arguments: serde_json::json!({
+                    "tx_hash": format!("0x{}", "11".repeat(32)),
+                    "archive_lookback_blocks": MAX_ARCHIVE_TX_LOOKBACK_BLOCKS + 1,
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("archive_lookback_blocks"));
     }
 
     #[test]
@@ -1121,7 +1601,7 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 17);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
         assert!(tools
             .iter()
@@ -1129,6 +1609,17 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_permissions"));
+        let tx_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "lunes_get_transaction_status")
+            .expect("transaction status tool");
+        assert!(tx_tool["inputSchema"]["properties"]
+            .get("archive_lookback_blocks")
+            .is_some());
+        assert!(tools.iter().any(|tool| tool["name"] == "lunes_stake_bond"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_stake_nominate"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_transfer_native"));
@@ -1136,6 +1627,107 @@ mod tests {
             .iter()
             .any(|tool| tool["name"] == "lunes_revoke_agent_wallet"));
         assert!(tools.iter().all(|tool| tool.get("inputSchema").is_some()));
+    }
+
+    #[test]
+    fn staking_bond_prepares_human_review_payload() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_bond".into(),
+                arguments: serde_json::json!({
+                    "amount": 100,
+                    "reward_destination": "staked"
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let text = &response.content[0].text;
+        assert!(text.contains("pending_human_approval"));
+        assert!(text.contains("staking.bond"));
+        assert!(text.contains("reward_destination"));
+    }
+
+    #[test]
+    fn staking_nominate_requires_validator_whitelist() {
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["staking.nominate".into()],
+                whitelisted_addresses: vec!["staking".into(), lunes_address(8)],
+                daily_limit_lunes: 1_000,
+                ttl_hours: 168,
+            },
+        );
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_nominate".into(),
+                arguments: serde_json::json!({
+                    "validators": [lunes_address(8), lunes_address(9)]
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("not in the whitelist"));
+    }
+
+    #[test]
+    fn staking_unbond_signs_when_autonomous_policy_allows_it() {
+        let kms = AgentKms::new(AgentMode::Autonomous, staking_permissions());
+        kms.provision_key().unwrap();
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_unbond".into(),
+                arguments: serde_json::json!({
+                    "amount": 50
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["action"], "staking.unbond");
+        assert_eq!(data["broadcasted"], false);
+        assert!(data["signature"].is_string());
+    }
+
+    #[test]
+    fn staking_chill_prepares_when_policy_allows_it() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_chill".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        assert!(response.content[0].text.contains("staking.chill"));
+    }
+
+    #[test]
+    fn staking_set_payee_account_requires_reward_account() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_set_payee".into(),
+                arguments: serde_json::json!({
+                    "reward_destination": "account"
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0]
+            .text
+            .contains("reward_account is required"));
     }
 
     #[test]

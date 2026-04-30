@@ -43,7 +43,7 @@ operator review. It does not yet broadcast final Lunes Network transactions.
 | Authentication | `Authorization: Bearer <token>` or `x-lunes-mcp-api-key: <token>` |
 | Guardrails | allowed extrinsics, destination whitelist, TTL, daily spend limit |
 | Runtime checks | request size limit, response size limit, connection cap, rate limiting |
-| Network status | live metadata, native balance reads, and limited transaction lookup; submission is not enabled yet |
+| Network status | live metadata, native balances, archive-assisted transaction lookup; submission is not enabled yet |
 
 ### Safety Model
 
@@ -52,6 +52,7 @@ The server is built to fail closed.
 - Public bind addresses are refused unless `LUNES_MCP_API_KEY` is configured.
 - Empty extrinsic allowlists block all write tools.
 - Empty destination whitelists block all write destinations.
+- Staking tools require the `staking` policy target in the whitelist; validator and reward-account addresses must also be whitelisted.
 - Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1`.
 - Contract calls in autonomous mode remain disabled until message-level allowlists are available.
 
@@ -66,7 +67,8 @@ action passes through explicit server-side policy.
 | Account visibility | Read native LUNES balances through live Lunes Network RPC |
 | Network awareness | Read live Lunes Network metadata, token settings, address format, and runtime version |
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
-| Transaction awareness | Check pending pool, current best block, and finalized head for a transaction hash |
+| Transaction awareness | Check pending pool, current heads, and the archive endpoint for a transaction hash |
+| Staking management | Prepare bond, unbond, withdraw, nominate, chill, and reward-destination updates |
 | Contract discovery | Look up ink! contract metadata through the Lunes tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
@@ -81,6 +83,7 @@ configured permission model.
 
 - Wallet operations inside agent tools without exposing private keys to the agent.
 - Address validation and permission checks before an agent proposes an irreversible action.
+- Staking and investment workflows where every operation is bounded by allowlists and review.
 - Human-reviewed transfer preparation for support, treasury, or operations teams.
 - Read-only account and transaction assistance in Claude Code, Codex, Cursor, Windsurf, and similar environments.
 - Bounded local automation for test flows where destination, extrinsic, TTL, and spend limits are explicitly configured.
@@ -142,6 +145,28 @@ bind_address = "127.0.0.1"
 port = 9950
 rate_limit_per_second = 10
 rate_limit_burst = 20
+```
+
+For staking workflows, the allowlist should be explicit. Include `staking` in
+`whitelisted_addresses`, and include each validator or reward-account address
+the agent may use:
+
+```toml
+[agent.permissions]
+allowed_extrinsics = [
+  "staking.bond",
+  "staking.unbond",
+  "staking.withdraw_unbonded",
+  "staking.nominate",
+  "staking.chill",
+  "staking.set_payee"
+]
+whitelisted_addresses = [
+  "staking",
+  "6validator_or_reward_account..."
+]
+daily_limit_lunes = 100
+ttl_hours = 168
 ```
 
 For a protected remote or container deployment:
@@ -341,11 +366,17 @@ use a client with HTTP MCP transport support.
 | `lunes_get_chain_info` | Read | Reads live Lunes Network metadata, token settings, address format, and runtime version |
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
-| `lunes_get_transaction_status` | Read | Checks pending pool, current best block, and finalized head for a transaction hash |
+| `lunes_get_transaction_status` | Read | Checks pending pool, current heads, and archive endpoint for a transaction hash; `archive_lookback_blocks` can widen the bounded archive search |
 | `lunes_search_contract` | Read | Looks up ink! contract metadata |
 | `lunes_transfer_native` | Write | Prepares or signs a native LUNES transfer |
 | `lunes_transfer_psp22` | Write | Prepares or signs a PSP22 transfer |
 | `lunes_call_contract` | Write | Prepares or signs an ink! contract call |
+| `lunes_stake_bond` | Write | Prepares or signs a staking bond operation |
+| `lunes_stake_unbond` | Write | Prepares or signs a staking unbond operation |
+| `lunes_stake_withdraw_unbonded` | Write | Prepares or signs withdrawal of unlocked staking funds |
+| `lunes_stake_nominate` | Write | Prepares or signs validator nominations |
+| `lunes_stake_chill` | Write | Prepares or signs a pause of active nominations |
+| `lunes_stake_set_payee` | Write | Prepares or signs staking reward destination updates |
 | `lunes_provision_agent_wallet` | Lifecycle | Creates a local agent key for approval |
 | `lunes_revoke_agent_wallet` | Lifecycle | Revokes the current local agent key |
 

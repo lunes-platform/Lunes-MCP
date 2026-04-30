@@ -125,7 +125,11 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("Refusing unsafe public bind on {addr}"))?;
 
     // 2. Initialize the KMS.
-    let lunes_client = LunesClient::new(rpc_url.clone(), config_file.network.rpc_failovers.clone());
+    let lunes_client = LunesClient::new(
+        rpc_url.clone(),
+        config_file.network.rpc_failovers.clone(),
+        archive_url.clone(),
+    );
     let kms = AgentKms::new(config_file.agent.wallet.mode, config_file.agent.permissions);
     let ctx = Arc::new(McpContext {
         kms,
