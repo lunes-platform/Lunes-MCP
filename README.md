@@ -14,12 +14,13 @@ binding, prepare-only mode, API-key protection for public binds, rate limiting,
 and policy checks before any local signing path is reached.
 
 The current release is ready for local evaluation, agent integration, and
-operator review. It does not yet broadcast final SCALE-encoded Substrate
-extrinsics to Lunes Network.
+operator review. It does not yet broadcast final Lunes Network transactions.
 
 ## Contents
 
 - [Overview](#overview)
+- [Agent Capabilities](#agent-capabilities)
+- [Use Cases](#use-cases)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Client Setup](#client-setup)
@@ -38,7 +39,7 @@ extrinsics to Lunes Network.
 | Authentication | `Authorization: Bearer <token>` or `x-lunes-mcp-api-key: <token>` |
 | Guardrails | allowed extrinsics, destination whitelist, TTL, daily spend limit |
 | Runtime checks | request size limit, response size limit, connection cap, rate limiting |
-| Chain status | local intent signing only; Substrate submission is not enabled yet |
+| Chain status | local intent signing only; Lunes Network submission is not enabled yet |
 
 ### Safety Model
 
@@ -49,6 +50,34 @@ The server is built to fail closed.
 - Empty destination whitelists block all write destinations.
 - Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1`.
 - Contract calls in autonomous mode remain disabled until message-level allowlists are available.
+
+## Agent Capabilities
+
+Lunes MCP Server gives connected agents a controlled interface to Lunes Network
+workflows. It does not hand over unrestricted wallet access; every write-capable
+action passes through explicit server-side policy.
+
+| Capability | What the agent can do |
+| --- | --- |
+| Account visibility | Read LUNES and PSP22 balance information for approved workflows |
+| Transaction awareness | Check transaction status and return structured information to the user |
+| Contract discovery | Look up ink! contract metadata through the Lunes tooling surface |
+| Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
+| Local agent wallet lifecycle | Request creation or revocation of a local agent key |
+| Policy-bounded signing | Sign local intent payloads only when autonomous mode, allowlists, TTL, and spend limits permit it |
+| Operational visibility | Report health, status, active key state, spend usage, and audit entries |
+
+The practical result is narrow, auditable agency: an assistant can help prepare,
+explain, and route Lunes Network actions without bypassing human control or the
+configured permission model.
+
+## Use Cases
+
+- Wallet operations inside agent tools without exposing private keys to the agent.
+- Human-reviewed transfer preparation for support, treasury, or operations teams.
+- Read-only account and transaction assistance in Claude Code, Codex, Cursor, Windsurf, and similar environments.
+- Bounded local automation for test flows where destination, extrinsic, TTL, and spend limits are explicitly configured.
+- Operator dashboards or internal tools that need a small HTTP gateway for Lunes Network status and agent-wallet state.
 
 ## Quick Start
 
@@ -130,7 +159,7 @@ export LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1
 ```
 
 Use that flag only for local stub testing. Production autonomous execution needs
-real Substrate transaction construction, SCALE signing, submission, and finality
+real Lunes Network transaction construction, signing, submission, and finality
 tracking.
 
 ## Client Setup

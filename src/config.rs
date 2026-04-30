@@ -218,7 +218,7 @@ pub enum ConfigError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigValidationError {
-    #[error("autonomous mode is disabled until real Substrate transaction signing is implemented; set {AUTONOMOUS_STUB_ENV_VAR}=1 only for local testing")]
+    #[error("autonomous mode is disabled until real Lunes Network transaction signing is implemented; set {AUTONOMOUS_STUB_ENV_VAR}=1 only for local testing")]
     StubNotAllowed,
 
     #[error("autonomous mode requires at least one allowed extrinsic")]

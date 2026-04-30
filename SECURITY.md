@@ -16,7 +16,7 @@ LUNES_MCP_API_KEY=<strong-random-token>
 
 The process refuses public bind addresses without an API key and enabled rate limit.
 Autonomous mode also refuses startup unless `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1`
-is set; this is for local testing only until real Substrate transaction signing
+is set; this is for local testing only until real Lunes Network transaction signing
 exists.
 
 ## Sensitive Files
@@ -32,7 +32,7 @@ The `.gitignore` blocks these patterns by default.
 
 ## Current Security Limitations
 
-- Blockchain calls are not yet backed by a real Substrate client.
+- Blockchain calls are not yet backed by a real Lunes Network client.
 - SS58 validation is syntactic and does not yet verify checksum/prefix.
 - Autonomous signatures are local intent payload signatures, not final SCALE extrinsic signatures.
 - Autonomous `contracts.call` is disabled until message allowlists and asset-specific limits exist.

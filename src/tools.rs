@@ -84,7 +84,7 @@ impl McpToolResult {
 
 // --- SS58 address validation --------------------------------------------
 
-/// Basic SS58 address validation for Substrate-style addresses.
+/// Basic SS58 address validation for Lunes-compatible addresses.
 /// Checks length and base58 characters only; checksum validation needs subxt.
 fn is_valid_ss58(address: &str) -> bool {
     if address.len() < 46 || address.len() > 48 {
@@ -274,13 +274,13 @@ fn handle_get_balance(args: &Value) -> McpToolResult {
         return e;
     }
 
-    // TODO: connect to Substrate RPC through subxt.
+    // TODO: connect to Lunes Network RPC.
     McpToolResult::success(serde_json::json!({
         "address": address,
         "asset": asset_id.unwrap_or("LUNES (native)"),
         "free_balance": "0",
         "reserved_balance": "0",
-        "note": "Substrate RPC integration pending (subxt)"
+        "note": "Lunes Network RPC integration pending"
     }))
 }
 
@@ -292,7 +292,7 @@ fn handle_get_tx_status(args: &Value) -> McpToolResult {
         return McpToolResult::error(-32001, "Missing required field: tx_hash".into());
     }
 
-    // TODO: connect to Substrate RPC.
+    // TODO: connect to Lunes Network RPC.
     McpToolResult::success(serde_json::json!({
         "tx_hash": tx_hash,
         "status": "pending_implementation",
@@ -311,7 +311,7 @@ fn handle_search_contract(args: &Value) -> McpToolResult {
         return e;
     }
 
-    // TODO: connect to Substrate RPC and the metadata registry.
+    // TODO: connect to Lunes Network RPC and the metadata registry.
     McpToolResult::success(serde_json::json!({
         "contract_address": contract_address,
         "status": "pending_implementation",
@@ -350,7 +350,7 @@ fn handle_transfer_native(args: &Value, kms: &AgentKms) -> McpToolResult {
                 "signer": pk,
                 "broadcasted": false,
                 "submission_status": "not_broadcasted",
-                "note": "Signed locally. Substrate broadcast pending."
+                "note": "Signed locally. Lunes Network broadcast pending."
             })
         },
         serde_json::json!({
@@ -401,7 +401,7 @@ fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
                 "signer": pk,
                 "broadcasted": false,
                 "submission_status": "not_broadcasted",
-                "note": "Signed locally. Substrate broadcast pending."
+                "note": "Signed locally. Lunes Network broadcast pending."
             })
         },
         serde_json::json!({
@@ -453,7 +453,7 @@ fn handle_call_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
                 "signer": pk,
                 "broadcasted": false,
                 "submission_status": "not_broadcasted",
-                "note": "Signed locally. Substrate broadcast pending."
+                "note": "Signed locally. Lunes Network broadcast pending."
             })
         },
         serde_json::json!({
