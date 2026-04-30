@@ -44,8 +44,11 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_get_account_overview` | Read | Inspect account nonce, native LUNES balances, spendable amount, and active agent policy |
 | `lunes_get_investment_position` | Read | Summarize liquid and reserved/locked LUNES for staking or treasury planning |
 | `lunes_get_validator_set` | Read | Read the current validator set from live Lunes Network state |
+| `lunes_get_validator_profiles` | Read | Read active-set status, commission, blocked state, and nomination eligibility for validators |
 | `lunes_get_staking_overview` | Read | Summarize validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_staking_account` | Read | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for one Lunes account |
+| `lunes_search_account_activity` | Read | Search pending transactions and recent finalized blocks for bounded account activity |
+| `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
 
 ## Project Structure
 
@@ -80,7 +83,8 @@ tool errors with `isError: true`.
 ## Testing Strategy
 
 - Unit tests cover tool response shape, policy summaries, validator limit
-  handling, and low-level state decoding.
+  handling, contract guardrails, account activity caps, and low-level state
+  decoding.
 - Existing HTTP integration tests continue to cover authentication and rate
   limiting.
 - Manual RPC checks verify the server can query the public Lunes endpoints.
@@ -100,7 +104,7 @@ Ask first:
 - adding dependencies;
 - changing public tool names or response fields;
 - enabling final Lunes Network transaction submission;
-- expanding staking reads into reward payout history, validator scoring, or
+- expanding staking reads into reward payout history, performance scoring, or
   automated validator selection.
 
 Never:
@@ -112,16 +116,20 @@ Never:
 
 ## Success Criteria
 
-- `tools/list` exposes the five read-only tools above.
+- `tools/list` exposes the read-only tools above.
 - `lunes_get_network_health` reads live Lunes Network status.
 - `lunes_get_account_overview` returns balance and nonce for a valid Lunes
   address.
 - `lunes_get_investment_position` gives agents a conservative liquidity and
   policy summary.
 - `lunes_get_validator_set` reads validator addresses from live network state.
+- `lunes_get_validator_profiles` returns bounded validator profile and
+  nomination eligibility hints without making recommendations.
 - `lunes_get_staking_overview` combines validator visibility with local policy
   boundaries.
 - `lunes_get_staking_account` returns live staking state, including unlocking
   chunks, for bonded, nominator, validator, and idle accounts without signing
   or broadcasting.
+- `lunes_search_account_activity` caps account activity scans.
+- `lunes_read_contract` requires contract message allowlists before live reads.
 - All verification commands pass before publishing.

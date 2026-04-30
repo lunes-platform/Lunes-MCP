@@ -11,7 +11,7 @@ use jsonrpsee::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::{convert::TryInto, sync::Arc, time::Duration};
+use std::{collections::HashSet, convert::TryInto, sync::Arc, time::Duration};
 
 const LUNES_ACCOUNT_STORAGE_PREFIX: &str =
     "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9";
@@ -29,6 +29,7 @@ pub struct LunesClient {
     static_network_health: Option<NetworkHealth>,
     static_validator_set: Option<ValidatorSet>,
     static_staking_account: Option<StakingAccount>,
+    static_validator_profiles: Option<Vec<ValidatorProfile>>,
 }
 
 impl LunesClient {
@@ -46,6 +47,7 @@ impl LunesClient {
             static_network_health: None,
             static_validator_set: None,
             static_staking_account: None,
+            static_validator_profiles: None,
         }
     }
 
@@ -61,6 +63,7 @@ impl LunesClient {
             static_network_health: None,
             static_validator_set: None,
             static_staking_account: None,
+            static_validator_profiles: None,
         }
     }
 
@@ -76,6 +79,7 @@ impl LunesClient {
             static_network_health: None,
             static_validator_set: None,
             static_staking_account: None,
+            static_validator_profiles: None,
         }
     }
 
@@ -91,6 +95,7 @@ impl LunesClient {
             static_network_health: None,
             static_validator_set: None,
             static_staking_account: None,
+            static_validator_profiles: None,
         }
     }
 
@@ -106,6 +111,7 @@ impl LunesClient {
             static_network_health: None,
             static_validator_set: None,
             static_staking_account: None,
+            static_validator_profiles: None,
         }
     }
 
@@ -121,6 +127,7 @@ impl LunesClient {
             static_network_health: Some(health),
             static_validator_set: None,
             static_staking_account: None,
+            static_validator_profiles: None,
         }
     }
 
@@ -136,6 +143,7 @@ impl LunesClient {
             static_network_health: None,
             static_validator_set: Some(validator_set),
             static_staking_account: None,
+            static_validator_profiles: None,
         }
     }
 
@@ -151,6 +159,23 @@ impl LunesClient {
             static_network_health: None,
             static_validator_set: None,
             static_staking_account: Some(staking_account),
+            static_validator_profiles: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_validator_profiles(profiles: Vec<ValidatorProfile>) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+            static_staking_account: None,
+            static_validator_profiles: Some(profiles),
         }
     }
 
@@ -163,6 +188,23 @@ impl LunesClient {
         for endpoint in self.endpoints.iter() {
             match fetch_chain_info(endpoint).await {
                 Ok(info) => return Ok(info),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    /// Read-only call to a Lunes contract dry run.
+    pub async fn fetch_contract_read(
+        &self,
+        contract: &str,
+        origin: &str,
+        input_data: &[u8],
+    ) -> Result<serde_json::Value, LunesClientError> {
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match fetch_contract_read(endpoint, contract, origin, input_data).await {
+                Ok(value) => return Ok(value),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -237,6 +279,25 @@ impl LunesClient {
         Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
     }
 
+    pub async fn validator_profiles(
+        &self,
+        validators: &[(String, [u8; 32])],
+    ) -> Result<Vec<ValidatorProfile>, LunesClientError> {
+        if let Some(profiles) = &self.static_validator_profiles {
+            return Ok(profiles.clone());
+        }
+
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match fetch_validator_profiles(endpoint, validators).await {
+                Ok(profiles) => return Ok(profiles),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
     pub async fn staking_account(
         &self,
         address: &str,
@@ -304,6 +365,31 @@ impl LunesClient {
 
         current_not_found.ok_or_else(|| last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
     }
+
+    pub async fn fetch_account_activity(
+        &self,
+        account_id: [u8; 32],
+        lookback_blocks: u64,
+    ) -> Result<serde_json::Value, LunesClientError> {
+        let mut last_error = None;
+
+        if let Some(archive_endpoint) = &self.archive_endpoint {
+            match fetch_recent_account_activity(archive_endpoint, &account_id, lookback_blocks)
+                .await
+            {
+                Ok(activity) => return Ok(activity),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        for endpoint in self.endpoints.iter() {
+            match fetch_recent_account_activity(endpoint, &account_id, lookback_blocks).await {
+                Ok(activity) => return Ok(activity),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
 }
 
 async fn fetch_chain_info(endpoint: &str) -> Result<ChainInfo, LunesClientError> {
@@ -349,6 +435,26 @@ async fn fetch_account_next_index(endpoint: &str, address: &str) -> Result<u64, 
     value_as_u64(&value).ok_or_else(|| {
         LunesClientError::InvalidRpcResponse("system_accountNextIndex returned no nonce".into())
     })
+}
+
+async fn fetch_contract_read(
+    endpoint: &str,
+    contract: &str,
+    origin: &str,
+    input_data: &[u8],
+) -> Result<Value, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let input_hex = format!("0x{}", hex::encode(input_data));
+    let call_request = serde_json::json!({
+        "origin": origin,
+        "dest": contract,
+        "value": 0,
+        "gasLimit": null,
+        "storageDepositLimit": null,
+        "inputData": input_hex,
+    });
+
+    rpc_request_params(&client, "contracts_call", vec![call_request]).await
 }
 
 async fn fetch_network_health(endpoint: &str) -> Result<NetworkHealth, LunesClientError> {
@@ -408,6 +514,69 @@ async fn fetch_validator_set(endpoint: &str) -> Result<ValidatorSet, LunesClient
         lookup: "session.validators".into(),
         validators,
     })
+}
+
+async fn fetch_validator_profiles(
+    endpoint: &str,
+    validators: &[(String, [u8; 32])],
+) -> Result<Vec<ValidatorProfile>, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let key = storage_prefix_key("Session", "Validators");
+    let storage: Option<String> =
+        rpc_request_params(&client, "state_getStorage", vec![Value::String(key)]).await?;
+    let active_validators = decode_session_validators(storage.as_deref())?
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    let mut profiles = Vec::with_capacity(validators.len());
+    for (address, account_id) in validators {
+        let validator_storage = staking_storage_for_account(
+            &client,
+            "Validators",
+            StorageHasher::Twox64Concat,
+            account_id,
+        )
+        .await?;
+        let validator_prefs = validator_storage
+            .as_deref()
+            .map(decode_validator_prefs)
+            .transpose()?;
+        let active_session_validator = active_validators.contains(account_id);
+        let blocked = validator_prefs
+            .as_ref()
+            .map(|prefs| prefs.blocked)
+            .unwrap_or(false);
+        let eligible_for_nomination =
+            active_session_validator && validator_prefs.is_some() && !blocked;
+        let mut nomination_warnings = Vec::new();
+
+        if !active_session_validator {
+            nomination_warnings.push("not_in_active_validator_set".into());
+        }
+        if validator_prefs.is_none() {
+            nomination_warnings.push("missing_validator_preferences".into());
+        }
+        if blocked {
+            nomination_warnings.push("validator_blocks_new_nominations".into());
+        }
+
+        profiles.push(ValidatorProfile {
+            address: address.clone(),
+            active_session_validator,
+            commission_perbill: validator_prefs
+                .as_ref()
+                .map(|prefs| prefs.commission_perbill),
+            commission_percent: validator_prefs
+                .as_ref()
+                .map(|prefs| prefs.commission_percent.clone()),
+            blocked,
+            eligible_for_nomination,
+            nomination_warnings,
+            lookup: "live_lunes_rpc_validator_profile_storage".into(),
+        });
+    }
+
+    Ok(profiles)
 }
 
 async fn fetch_staking_account(
@@ -563,6 +732,53 @@ async fn fetch_archive_transaction_status(
     }
 
     Ok(TransactionStatus::not_found(tx_hash, lookup_scope))
+}
+
+async fn fetch_recent_account_activity(
+    endpoint: &str,
+    account_id: &[u8; 32],
+    lookback_blocks: u64,
+) -> Result<serde_json::Value, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let pub_hex = hex::encode(account_id);
+
+    let mut pending_activity = Vec::new();
+    let pending_extrinsics: Vec<String> = rpc_request(&client, "author_pendingExtrinsics").await?;
+    for (i, ext) in pending_extrinsics.iter().enumerate() {
+        if ext.contains(&pub_hex) {
+            pending_activity.push(i);
+        }
+    }
+
+    let mut blocks_with_activity = Vec::new();
+    let finalized_hash: String = rpc_request(&client, "chain_getFinalizedHead").await?;
+    let finalized_block = fetch_block(&client, &finalized_hash).await?;
+
+    if let Some(block) = finalized_block {
+        let oldest = block.number.saturating_sub(lookback_blocks);
+        for number in (oldest..=block.number).rev() {
+            let Some(block_hash) = fetch_block_hash_at(&client, number).await? else {
+                continue;
+            };
+            let Some(b) = fetch_block(&client, &block_hash).await? else {
+                continue;
+            };
+
+            for ext in b.extrinsics {
+                if ext.contains(&pub_hex) {
+                    blocks_with_activity.push(b.number);
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "account": pub_hex,
+        "mempool_pending_txs": pending_activity.len(),
+        "recent_active_blocks": blocks_with_activity,
+        "note": format!("Scanned last {} finalized blocks", lookback_blocks),
+    }))
 }
 async fn connect_client(endpoint: &str) -> Result<WsClient, LunesClientError> {
     WsClientBuilder::default()
@@ -778,6 +994,18 @@ impl NativeBalance {
 pub struct ValidatorSet {
     pub lookup: String,
     pub validators: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ValidatorProfile {
+    pub address: String,
+    pub active_session_validator: bool,
+    pub commission_perbill: Option<u32>,
+    pub commission_percent: Option<String>,
+    pub blocked: bool,
+    pub eligible_for_nomination: bool,
+    pub nomination_warnings: Vec<String>,
+    pub lookup: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

@@ -4,6 +4,7 @@
 //! It loads the agent configuration, initializes the KMS, registers RPC
 //! methods, and applies policy and transport guardrails before handling calls.
 
+mod abi_registry;
 mod address;
 mod config;
 mod kms;

@@ -55,7 +55,7 @@ The server is built to fail closed.
 - Empty destination whitelists block all write destinations.
 - Staking tools require the `staking` policy target in the whitelist; validator and reward-account addresses must also be whitelisted.
 - Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1`.
-- Contract calls in autonomous mode remain disabled until message-level allowlists are available.
+- Read-only contract simulation requires message-level allowlists; autonomous contract writes remain disabled until asset-specific limits are available.
 
 ## Agent Capabilities
 
@@ -70,10 +70,11 @@ action passes through explicit server-side policy.
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
 | Transaction awareness | Check pending pool, current heads, and the archive endpoint for a transaction hash |
 | Validator visibility | Read the current validator set and expose bounded samples to agents |
+| Validator profiles | Inspect active-set status, commission, blocked state, and nomination eligibility hints |
 | Staking account state | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for a Lunes account |
 | Investment planning | Summarize liquid and reserved/locked LUNES for conservative staking or treasury planning |
 | Staking management | Prepare bond, unbond, withdraw, nominate, chill, and reward-destination updates |
-| Contract discovery | Look up ink! contract metadata through the Lunes tooling surface |
+| Contract discovery | Look up Lunes contract interface metadata through the tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
 | Policy-bounded signing | Sign local intent payloads only when autonomous mode, allowlists, TTL, and spend limits permit it |
@@ -143,6 +144,7 @@ mode = "prepare_only"
 allowed_extrinsics = []
 whitelisted_addresses = []
 daily_limit_lunes = 0
+allowlist_contracts = {}
 ttl_hours = 168
 
 [server]
@@ -373,15 +375,18 @@ use a client with HTTP MCP transport support.
 | `lunes_get_investment_position` | Read | Summarizes liquid and reserved/locked LUNES for staking or treasury planning |
 | `lunes_get_validator_set` | Read | Reads the current validator set from live Lunes Network state |
 | `lunes_get_staking_overview` | Read | Summarizes validator visibility and the staking actions this agent is allowed to prepare |
+| `lunes_get_validator_profiles` | Read | Reads validator active-set status, commission, blocked state, and nomination eligibility |
 | `lunes_get_staking_account` | Read | Reads live staking state for one account, including bond, ledger, unlocking schedule, rewards destination, nominations, and validator preferences when present |
 | `lunes_get_chain_info` | Read | Reads live Lunes Network metadata, token settings, address format, and runtime version |
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
 | `lunes_get_transaction_status` | Read | Checks pending pool, current heads, and archive endpoint for a transaction hash; `archive_lookback_blocks` can widen the bounded archive search |
-| `lunes_search_contract` | Read | Looks up ink! contract metadata |
+| `lunes_search_account_activity` | Read | Searches pending transactions and recent finalized blocks for account activity |
+| `lunes_read_contract` | Read | Simulates a read-only Lunes contract call through live RPC when allowed by contract message policy |
+| `lunes_search_contract` | Read | Looks up Lunes contract interface metadata |
 | `lunes_transfer_native` | Write | Prepares or signs a native LUNES transfer |
 | `lunes_transfer_psp22` | Write | Prepares or signs a PSP22 transfer |
-| `lunes_call_contract` | Write | Prepares or signs an ink! contract call |
+| `lunes_call_contract` | Write | Prepares or signs a Lunes contract call |
 | `lunes_stake_bond` | Write | Prepares or signs a staking bond operation |
 | `lunes_stake_unbond` | Write | Prepares or signs a staking unbond operation |
 | `lunes_stake_withdraw_unbonded` | Write | Prepares or signs withdrawal of unlocked staking funds |

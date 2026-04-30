@@ -41,6 +41,10 @@ whitelisted_addresses = []
 # Zero blocks autonomous spend and native transfer preparation.
 daily_limit_lunes = 0
 
+# Read-only contract simulations require an explicit message allowlist.
+# Example: { "6contract..." = ["PSP22::balance_of"] }
+allowlist_contracts = {}
+
 # Agent key lifetime in hours. Zero disables expiration.
 ttl_hours = 168
 

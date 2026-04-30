@@ -250,6 +250,28 @@ impl AgentKms {
         &self.mode
     }
 
+    /// Validates whether the agent may call a specific message on a Lunes contract.
+    pub fn validate_contract_call(
+        &self,
+        contract_address: &str,
+        method_name: &str,
+    ) -> Result<(), KmsError> {
+        if let Some(allowed_methods) = self.permissions.allowlist_contracts.get(contract_address) {
+            // An empty method list means every message on this contract is allowed.
+            if allowed_methods.is_empty() {
+                return Ok(());
+            }
+
+            if allowed_methods.iter().any(|m| m == method_name) {
+                return Ok(());
+            }
+        }
+
+        Err(KmsError::UnauthorizedDestination(
+            contract_address.to_string(),
+        ))
+    }
+
     pub fn permissions(&self) -> &PermissionsConfig {
         &self.permissions
     }
@@ -503,7 +525,10 @@ mod tests {
             allowed_extrinsics: vec!["balances.transfer".into(), "contracts.call".into()],
             whitelisted_addresses: vec!["5Gxyz".into(), "5G".into()],
             daily_limit_lunes: 100,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         }
     }
 
@@ -565,7 +590,10 @@ mod tests {
             allowed_extrinsics: vec![],
             whitelisted_addresses: vec![],
             daily_limit_lunes: 100,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         };
         let kms = AgentKms::new(AgentMode::Autonomous, perms);
         kms.provision_key().unwrap();
@@ -582,7 +610,10 @@ mod tests {
             allowed_extrinsics: vec!["balances.transfer".into()],
             whitelisted_addresses: vec![],
             daily_limit_lunes: 100,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         };
         let kms = AgentKms::new(AgentMode::Autonomous, perms);
         kms.provision_key().unwrap();
@@ -614,7 +645,10 @@ mod tests {
             allowed_extrinsics: vec!["balances.transfer".into()],
             whitelisted_addresses: vec!["5Gxyz".into()],
             daily_limit_lunes: 0,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         };
         let kms = AgentKms::new(AgentMode::Autonomous, perms);
         kms.provision_key().unwrap();
@@ -631,7 +665,10 @@ mod tests {
             allowed_extrinsics: vec!["balances.transfer".into()],
             whitelisted_addresses: vec!["5Gxyz".into()],
             daily_limit_lunes: u64::MAX,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         };
         let kms = AgentKms::new(AgentMode::Autonomous, perms);
         kms.provision_key().unwrap();
@@ -650,7 +687,10 @@ mod tests {
             allowed_extrinsics: vec!["balances.transfer".into()],
             whitelisted_addresses: vec!["5GoodAddress".into()],
             daily_limit_lunes: 1000,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         };
         let kms = AgentKms::new(AgentMode::Autonomous, perms);
         kms.provision_key().unwrap();

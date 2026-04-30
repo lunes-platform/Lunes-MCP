@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::abi_registry::AbiRegistry;
 use crate::address::{validate_lunes_address, LUNES_SS58_PREFIX};
 use crate::kms::AgentKms;
 use crate::lunes_client::{
@@ -131,13 +132,16 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_validate_address" => handle_validate_address(&request.arguments),
         "lunes_get_permissions" => handle_get_permissions(kms),
         "lunes_get_balance"
+        | "lunes_search_account_activity"
         | "lunes_get_transaction_status"
         | "lunes_get_network_health"
         | "lunes_get_account_overview"
         | "lunes_get_investment_position"
         | "lunes_get_validator_set"
+        | "lunes_get_validator_profiles"
         | "lunes_get_staking_overview"
-        | "lunes_get_staking_account" => {
+        | "lunes_get_staking_account"
+        | "lunes_read_contract" => {
             McpToolResult::error(-32020, "Tool requires a live Lunes RPC client".into())
         }
 
@@ -178,6 +182,9 @@ pub async fn dispatch_tool_call_with_chain(
         "lunes_get_validator_set" => {
             handle_get_validator_set(&request.arguments, lunes_client).await
         }
+        "lunes_get_validator_profiles" => {
+            handle_get_validator_profiles(&request.arguments, lunes_client).await
+        }
         "lunes_get_staking_overview" => {
             handle_get_staking_overview(&request.arguments, kms, lunes_client).await
         }
@@ -187,6 +194,10 @@ pub async fn dispatch_tool_call_with_chain(
         "lunes_get_transaction_status" => {
             handle_get_tx_status(&request.arguments, lunes_client).await
         }
+        "lunes_search_account_activity" => {
+            handle_search_account_activity(&request.arguments, lunes_client).await
+        }
+        "lunes_read_contract" => handle_read_contract(&request.arguments, kms, lunes_client).await,
         _ => dispatch_tool_call(request, kms),
     }
 }
@@ -267,6 +278,28 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "lunes_get_validator_profiles",
+            "description": "Read live validator profile data, including active-set status, commission, blocked state, and nomination eligibility.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "validators": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_VALIDATOR_LIMIT,
+                        "items": { "type": "string" },
+                        "description": "Optional validator addresses. If omitted, the tool samples the active validator set."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_VALIDATOR_LIMIT,
+                        "description": "Maximum validators to profile when validators is omitted. Defaults to 16."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "lunes_get_staking_account",
             "description": "Read live staking state for one Lunes account, including bond, ledger, reward destination, nominations, and validator preferences when present.",
             "inputSchema": {
@@ -295,8 +328,34 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "lunes_search_account_activity",
+            "description": "Search the mempool and recent archive blocks for activity involving a specific account. Useful for debugging frozen state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Lunes format address to scan for." },
+                    "lookback_blocks": { "type": "integer", "minimum": 0, "maximum": MAX_ARCHIVE_TX_LOOKBACK_BLOCKS, "description": "Number of recent blocks to scan. Defaults to the bounded archive lookup window." }
+                },
+                "required": ["address"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_read_contract",
+            "description": "Simulate a read-only Lunes contract call through live RPC.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_address": { "type": "string", "description": "Lunes format address of the contract." },
+                    "origin": { "type": "string", "description": "Optional Lunes origin address for the dry run. Defaults to contract_address." },
+                    "method": { "type": "string", "description": "Method name to call (e.g., 'PSP22::balance_of' or 'transfer')." },
+                    "args_hex": { "type": "string", "description": "Hex-encoded Lunes contract arguments without the 4-byte selector (optional)." }
+                },
+                "required": ["contract_address", "method"]
+            }
+        }),
+        serde_json::json!({
             "name": "lunes_search_contract",
-            "description": "Look up metadata and ABI details for an ink! contract.",
+            "description": "Look up metadata and interface details for a Lunes contract.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -359,7 +418,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "lunes_call_contract",
-            "description": "Prepare or sign a generic ink! contract call.",
+            "description": "Prepare or sign a generic Lunes contract call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -480,7 +539,18 @@ fn execute_write_operation(
 
     // Prepare-only mode returns a payload for external human review.
     if !kms.is_autonomous() {
-        return McpToolResult::pending(pending_data);
+        let mut final_pending = pending_data;
+        if kms.permissions().human_approval_required {
+            if let Some(template) = &kms.permissions().approval_message_template {
+                if let Some(obj) = final_pending.as_object_mut() {
+                    obj.insert(
+                        "human_approval_notice".to_string(),
+                        Value::String(template.clone()),
+                    );
+                }
+            }
+        }
+        return McpToolResult::pending(final_pending);
     }
 
     // Autonomous mode signs through the KMS after all checks pass.
@@ -666,6 +736,73 @@ async fn handle_get_validator_set(args: &Value, lunes_client: &LunesClient) -> M
     }
 }
 
+async fn handle_get_validator_profiles(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let limit = match validator_limit_arg(args, "limit") {
+        Ok(limit) => limit,
+        Err(error) => return error,
+    };
+    let validators = match optional_string_array(args, "validators") {
+        Ok(Some(validators)) => {
+            if validators.is_empty() {
+                return McpToolResult::error(-32001, "validators must not be empty".into());
+            }
+            if validators.len() > MAX_VALIDATOR_LIMIT {
+                return McpToolResult::error(
+                    -32001,
+                    format!("validators exceeds maximum of {MAX_VALIDATOR_LIMIT}"),
+                );
+            }
+            validators
+        }
+        Ok(None) => match lunes_client.validator_set().await {
+            Ok(validator_set) => validator_set.validators.into_iter().take(limit).collect(),
+            Err(error) => return McpToolResult::error(-32020, error.to_string()),
+        },
+        Err(error) => return error,
+    };
+
+    let mut parsed_validators = Vec::with_capacity(validators.len());
+    for validator in &validators {
+        let parsed = match parse_lunes_address(validator, "validators") {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
+        };
+        parsed_validators.push((validator.clone(), parsed.account_id));
+    }
+
+    match lunes_client.validator_profiles(&parsed_validators).await {
+        Ok(profiles) => {
+            let eligible_count = profiles
+                .iter()
+                .filter(|profile| profile.eligible_for_nomination)
+                .count();
+            let blocked_count = profiles.iter().filter(|profile| profile.blocked).count();
+            let inactive_count = profiles
+                .iter()
+                .filter(|profile| !profile.active_session_validator)
+                .count();
+
+            McpToolResult::success(serde_json::json!({
+                "lookup": "live_lunes_rpc_validator_profile_storage",
+                "requested": validators.len(),
+                "returned": profiles.len(),
+                "summary": {
+                    "eligible_for_nomination": eligible_count,
+                    "blocked": blocked_count,
+                    "inactive_or_unknown": inactive_count,
+                },
+                "profiles": profiles,
+                "risk_notes": [
+                    "Eligibility is a safety hint, not financial advice.",
+                    "Agents should only nominate validators allowed by the configured whitelist.",
+                    "Performance scoring and reward history remain future live reads."
+                ],
+            }))
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
 async fn handle_get_staking_overview(
     args: &Value,
     kms: &AgentKms,
@@ -841,7 +978,38 @@ async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpTo
     }
 }
 
-/// `lunes_search_contract` - looks up ink! contract metadata.
+async fn handle_search_account_activity(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    let lookback_blocks = args
+        .get("lookback_blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS);
+
+    if lookback_blocks > MAX_ARCHIVE_TX_LOOKBACK_BLOCKS {
+        return McpToolResult::error(
+            -32001,
+            format!(
+                "lookback_blocks must be <= {}",
+                MAX_ARCHIVE_TX_LOOKBACK_BLOCKS
+            ),
+        );
+    }
+
+    let parsed = match parse_lunes_address(address, "address") {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+
+    match lunes_client
+        .fetch_account_activity(parsed.account_id, lookback_blocks)
+        .await
+    {
+        Ok(activity) => McpToolResult::success(activity),
+        Err(e) => McpToolResult::error(-32020, format!("Failed to search account activity: {}", e)),
+    }
+}
+
+/// `lunes_search_contract` - looks up Lunes contract metadata.
 fn handle_search_contract(args: &Value) -> McpToolResult {
     let contract_address = args
         .get("contract_address")
@@ -852,11 +1020,13 @@ fn handle_search_contract(args: &Value) -> McpToolResult {
         return e;
     }
 
-    // TODO: connect to Lunes Network RPC and the metadata registry.
+    let registry = AbiRegistry::new();
     McpToolResult::success(serde_json::json!({
         "contract_address": contract_address,
-        "status": "pending_implementation",
-        "note": "Will return ABI messages from on-chain metadata"
+        "metadata_source": "local_lunes_contract_interface_registry",
+        "known_interfaces": ["PSP22"],
+        "known_messages": registry.known_messages(),
+        "note": "Live contract metadata lookup is planned; this response exposes the local interface registry used by agent guardrails."
     }))
 }
 
@@ -1200,7 +1370,7 @@ fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_call_contract` - prepares or signs a generic ink! contract call.
+/// `lunes_call_contract` - prepares or signs a generic Lunes contract call.
 fn handle_call_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
     let contract = args
         .get("contract_address")
@@ -1531,6 +1701,17 @@ fn string_array(args: &Value, field_name: &str) -> Result<Vec<String>, McpToolRe
         .collect()
 }
 
+fn optional_string_array(
+    args: &Value,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, McpToolResult> {
+    if args.get(field_name).is_none() {
+        return Ok(None);
+    }
+
+    string_array(args, field_name).map(Some)
+}
+
 fn validate_reward_account_whitelist(
     kms: &AgentKms,
     reward: &RewardDestination,
@@ -1583,6 +1764,65 @@ fn handle_revoke_wallet(kms: &AgentKms) -> McpToolResult {
     }))
 }
 
+// --- Contract Read Operations --------------------------------------------
+
+async fn handle_read_contract(args: &Value, kms: &AgentKms, client: &LunesClient) -> McpToolResult {
+    let contract = args
+        .get("contract_address")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let args_hex = args.get("args_hex").and_then(|v| v.as_str()).unwrap_or("");
+    let origin = args
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .unwrap_or(contract);
+
+    if let Err(error) = validate_address(contract, "contract_address") {
+        return error;
+    }
+    if let Err(error) = validate_address(origin, "origin") {
+        return error;
+    }
+    if method.is_empty() {
+        return McpToolResult::error(-32001, "Missing required field: method".into());
+    }
+
+    if let Err(e) = kms.validate_contract_call(contract, method) {
+        return McpToolResult::error(e.error_code(), e.to_string());
+    }
+
+    let registry = AbiRegistry::new();
+    let selector = match registry.resolve_selector(method) {
+        Some(s) => s,
+        None => {
+            return McpToolResult::error(
+                -32001,
+                format!("Method '{method}' selector is not in the local Lunes contract registry."),
+            )
+        }
+    };
+
+    let mut data = selector.to_vec();
+    if !args_hex.is_empty() {
+        let clean_hex = args_hex.trim_start_matches("0x");
+        match hex::decode(clean_hex) {
+            Ok(decoded) => data.extend_from_slice(&decoded),
+            Err(e) => return McpToolResult::error(-32001, format!("Invalid args_hex: {}", e)),
+        }
+    }
+
+    match client.fetch_contract_read(contract, origin, &data).await {
+        Ok(result) => McpToolResult::success(serde_json::json!({
+            "contract_address": contract,
+            "method": method,
+            "raw_result": result,
+            "note": "Raw result is returned as provided by Lunes RPC. Decoding depends on the contract return type.",
+        })),
+        Err(e) => McpToolResult::error(-32021, format!("Contract read failed: {}", e)),
+    }
+}
+
 // --- Tests ---------------------------------------------------------------
 
 #[cfg(test)]
@@ -1593,7 +1833,7 @@ mod tests {
     use crate::lunes_client::{
         ChainInfo, ChainProperties, NativeBalance, NetworkHealth, Nominations, RuntimeInfo,
         StakingAccount, StakingLedger, StakingRewardDestination, TransactionState,
-        TransactionStatus, UnlockChunk, ValidatorPrefs, ValidatorSet,
+        TransactionStatus, UnlockChunk, ValidatorPrefs, ValidatorProfile, ValidatorSet,
     };
 
     fn lunes_address(seed: u8) -> String {
@@ -1605,7 +1845,10 @@ mod tests {
             allowed_extrinsics: vec!["balances.transfer".into(), "contracts.call".into()],
             whitelisted_addresses: vec![lunes_address(1)],
             daily_limit_lunes: 100,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         }
     }
 
@@ -1621,7 +1864,10 @@ mod tests {
             ],
             whitelisted_addresses: vec!["staking".into(), lunes_address(8), lunes_address(9)],
             daily_limit_lunes: 1_000,
+            allowlist_contracts: Default::default(),
             ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
         }
     }
 
@@ -1853,6 +2099,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_validator_profiles_reports_nomination_eligibility() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let first = lunes_address(8);
+        let second = lunes_address(9);
+        let client = LunesClient::static_validator_profiles(vec![
+            ValidatorProfile {
+                address: first.clone(),
+                active_session_validator: true,
+                commission_perbill: Some(100_000_000),
+                commission_percent: Some("10.0000".into()),
+                blocked: false,
+                eligible_for_nomination: true,
+                nomination_warnings: vec![],
+                lookup: "live_lunes_rpc_validator_profile_storage".into(),
+            },
+            ValidatorProfile {
+                address: second.clone(),
+                active_session_validator: true,
+                commission_perbill: Some(250_000_000),
+                commission_percent: Some("25.0000".into()),
+                blocked: true,
+                eligible_for_nomination: false,
+                nomination_warnings: vec!["validator_blocks_new_nominations".into()],
+                lookup: "live_lunes_rpc_validator_profile_storage".into(),
+            },
+        ]);
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_validator_profiles".into(),
+                arguments: serde_json::json!({ "validators": [first, second] }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["returned"], 2);
+        assert_eq!(data["summary"]["eligible_for_nomination"], 1);
+        assert_eq!(data["summary"]["blocked"], 1);
+        assert_eq!(data["profiles"][0]["commission_percent"], "10.0000");
+        assert_eq!(data["profiles"][1]["eligible_for_nomination"], false);
+    }
+
+    #[tokio::test]
     async fn get_staking_overview_summarizes_available_read_state() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
         let client = LunesClient::static_validator_set(ValidatorSet {
@@ -2030,6 +2323,28 @@ mod tests {
         assert!(response.content[0].text.contains("archive_lookback_blocks"));
     }
 
+    #[tokio::test]
+    async fn search_account_activity_rejects_lookback_above_limit() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_native_balance(NativeBalance::zero());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_search_account_activity".into(),
+                arguments: serde_json::json!({
+                    "address": lunes_address(1),
+                    "lookback_blocks": MAX_ARCHIVE_TX_LOOKBACK_BLOCKS + 1,
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("lookback_blocks"));
+    }
+
     #[test]
     fn validate_address_reports_lunes_prefix_and_account_id() {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
@@ -2088,6 +2403,28 @@ mod tests {
             false
         );
         assert_eq!(data["policy"]["daily_limit_lunes"], 100);
+    }
+
+    #[tokio::test]
+    async fn read_contract_requires_message_allowlist() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_native_balance(NativeBalance::zero());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_read_contract".into(),
+                arguments: serde_json::json!({
+                    "contract_address": lunes_address(1),
+                    "method": "PSP22::balance_of"
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("not in the whitelist"));
     }
 
     #[tokio::test]
@@ -2182,7 +2519,10 @@ mod tests {
                 allowed_extrinsics: vec!["contracts.call".into()],
                 whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 5,
+                allowlist_contracts: Default::default(),
                 ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
             },
         );
         kms.provision_key().unwrap();
@@ -2244,7 +2584,7 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 26);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
         assert!(tools
             .iter()
@@ -2258,6 +2598,9 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_validator_set"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_validator_profiles"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_staking_overview"));
@@ -2277,6 +2620,12 @@ mod tests {
         assert!(tx_tool["inputSchema"]["properties"]
             .get("archive_lookback_blocks")
             .is_some());
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_search_account_activity"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_read_contract"));
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_stake_bond"));
         assert!(tools
             .iter()
@@ -2319,7 +2668,10 @@ mod tests {
                 allowed_extrinsics: vec!["staking.nominate".into()],
                 whitelisted_addresses: vec!["staking".into(), lunes_address(8)],
                 daily_limit_lunes: 1_000,
+                allowlist_contracts: Default::default(),
                 ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
             },
         );
         let response = dispatch_tool_call(

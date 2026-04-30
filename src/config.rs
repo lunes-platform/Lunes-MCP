@@ -3,6 +3,7 @@
 /// Loads the `agent_config.toml` file that controls agent mode,
 /// permission boundaries, and server transport settings.
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 // --- Typed enums ---------------------------------------------------------
@@ -74,13 +75,28 @@ pub struct PermissionsConfig {
     /// Maximum LUNES amount the agent may spend in a 24-hour window.
     pub daily_limit_lunes: u64,
 
+    /// Allowed messages per contract, keyed by Lunes contract address.
+    #[serde(default)]
+    pub allowlist_contracts: HashMap<String, Vec<String>>,
+
     /// Agent key lifetime in hours. Zero disables expiration.
     #[serde(default = "default_ttl_hours")]
     pub ttl_hours: u64,
+
+    /// Whether pending write responses include an explicit human approval notice.
+    #[serde(default = "default_human_approval")]
+    pub human_approval_required: bool,
+
+    /// Custom template for human approval pending message.
+    pub approval_message_template: Option<String>,
 }
 
 fn default_ttl_hours() -> u64 {
     168 // 7 days
+}
+
+fn default_human_approval() -> bool {
+    true
 }
 
 /// HTTP/RPC server configuration.
@@ -153,7 +169,10 @@ pub fn default_safe_config() -> ConfigFile {
                 allowed_extrinsics: vec![],
                 whitelisted_addresses: vec![],
                 daily_limit_lunes: 0,
-                ttl_hours: 0,
+                allowlist_contracts: HashMap::new(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
             },
         },
         server: None,
@@ -266,6 +285,7 @@ ttl_hours = 48
         assert_eq!(file.agent.permissions.daily_limit_lunes, 100);
         assert_eq!(file.agent.permissions.ttl_hours, 48);
         assert_eq!(file.agent.permissions.whitelisted_addresses.len(), 1);
+        assert!(file.agent.permissions.allowlist_contracts.is_empty());
     }
 
     #[test]
@@ -381,7 +401,10 @@ daily_limit_lunes = 0
                         .map(str::to_string)
                         .collect(),
                     daily_limit_lunes,
+                    allowlist_contracts: HashMap::new(),
                     ttl_hours,
+                    human_approval_required: true,
+                    approval_message_template: None,
                 },
             },
             server: None,
