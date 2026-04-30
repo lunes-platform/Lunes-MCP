@@ -70,6 +70,7 @@ action passes through explicit server-side policy.
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
 | Transaction awareness | Check pending pool, current heads, and the archive endpoint for a transaction hash |
 | Validator visibility | Read the current validator set and expose bounded samples to agents |
+| Staking account state | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for a Lunes account |
 | Investment planning | Summarize liquid and reserved/locked LUNES for conservative staking or treasury planning |
 | Staking management | Prepare bond, unbond, withdraw, nominate, chill, and reward-destination updates |
 | Contract discovery | Look up ink! contract metadata through the Lunes tooling surface |
@@ -372,6 +373,7 @@ use a client with HTTP MCP transport support.
 | `lunes_get_investment_position` | Read | Summarizes liquid and reserved/locked LUNES for staking or treasury planning |
 | `lunes_get_validator_set` | Read | Reads the current validator set from live Lunes Network state |
 | `lunes_get_staking_overview` | Read | Summarizes validator visibility and the staking actions this agent is allowed to prepare |
+| `lunes_get_staking_account` | Read | Reads live staking state for one account, including bond, ledger, unlocking schedule, rewards destination, nominations, and validator preferences when present |
 | `lunes_get_chain_info` | Read | Reads live Lunes Network metadata, token settings, address format, and runtime version |
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |

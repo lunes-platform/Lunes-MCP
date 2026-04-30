@@ -136,7 +136,8 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         | "lunes_get_account_overview"
         | "lunes_get_investment_position"
         | "lunes_get_validator_set"
-        | "lunes_get_staking_overview" => {
+        | "lunes_get_staking_overview"
+        | "lunes_get_staking_account" => {
             McpToolResult::error(-32020, "Tool requires a live Lunes RPC client".into())
         }
 
@@ -179,6 +180,9 @@ pub async fn dispatch_tool_call_with_chain(
         }
         "lunes_get_staking_overview" => {
             handle_get_staking_overview(&request.arguments, kms, lunes_client).await
+        }
+        "lunes_get_staking_account" => {
+            handle_get_staking_account(&request.arguments, kms, lunes_client).await
         }
         "lunes_get_transaction_status" => {
             handle_get_tx_status(&request.arguments, lunes_client).await
@@ -260,6 +264,17 @@ pub fn tool_definitions() -> Vec<Value> {
                         "description": "Maximum validator addresses to include in the sample. Defaults to 16."
                     }
                 }
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_staking_account",
+            "description": "Read live staking state for one Lunes account, including bond, ledger, reward destination, nominations, and validator preferences when present.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "SS58 address on Lunes Network." }
+                },
+                "required": ["address"]
             }
         }),
         serde_json::json!({
@@ -680,12 +695,92 @@ async fn handle_get_staking_overview(
                 "write_status": "prepare_or_local_intent_only",
                 "broadcast_enabled": false,
                 "next_live_reads": [
-                    "staking ledger",
-                    "active nominations",
-                    "reward destination",
-                    "unbonding schedule",
-                    "validator commission and exposure"
+                    "reward payout history",
+                    "validator exposure",
+                    "validator performance scoring"
                 ],
+            }))
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+async fn handle_get_staking_account(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    let parsed = match parse_lunes_address(address, "address") {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+
+    match lunes_client
+        .staking_account(address, parsed.account_id)
+        .await
+    {
+        Ok(staking_account) => {
+            let ledger = staking_account.ledger.as_ref().map(|ledger| {
+                let unlocking = ledger
+                    .unlocking
+                    .iter()
+                    .map(|chunk| {
+                        serde_json::json!({
+                            "value_base_units": chunk.value_base_units.to_string(),
+                            "value_lunes": format_lunes_amount(chunk.value_base_units),
+                            "era": chunk.era,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                serde_json::json!({
+                    "stash_address": ledger.stash_address.clone(),
+                    "total_base_units": ledger.total_base_units.to_string(),
+                    "active_base_units": ledger.active_base_units.to_string(),
+                    "unlocking_or_inactive_base_units": ledger.unlocking_or_inactive_base_units.to_string(),
+                    "total_lunes": format_lunes_amount(ledger.total_base_units),
+                    "active_lunes": format_lunes_amount(ledger.active_base_units),
+                    "unlocking_or_inactive_lunes": format_lunes_amount(ledger.unlocking_or_inactive_base_units),
+                    "unlocking": unlocking,
+                    "claimed_rewards": ledger.claimed_rewards.clone(),
+                    "raw_extra_bytes": ledger.raw_extra_bytes,
+                })
+            });
+            let nominations = staking_account.nominations.as_ref().map(|nominations| {
+                serde_json::json!({
+                    "targets": nominations.targets.clone(),
+                    "target_count": nominations.targets.len(),
+                    "submitted_in": nominations.submitted_in,
+                    "suppressed": nominations.suppressed,
+                })
+            });
+            let validator_prefs = staking_account.validator_prefs.as_ref().map(|prefs| {
+                serde_json::json!({
+                    "commission_perbill": prefs.commission_perbill,
+                    "commission_percent": prefs.commission_percent.clone(),
+                    "blocked": prefs.blocked,
+                })
+            });
+
+            McpToolResult::success(serde_json::json!({
+                "address": staking_account.address,
+                "stash_address": staking_account.stash_address,
+                "controller_address": staking_account.controller_address,
+                "bonded": staking_account.bonded,
+                "roles": staking_account.roles,
+                "ledger": ledger,
+                "reward_destination": staking_account.reward_destination,
+                "nominations": nominations,
+                "validator_prefs": validator_prefs,
+                "agent_policy": agent_policy_json(kms),
+                "agent_actions": {
+                    "can_prepare_staking_actions": can_prepare_writes(kms) && can_manage_staking(kms),
+                    "can_sign_local_intents": kms.is_autonomous() && kms.is_active(),
+                    "can_broadcast_to_lunes_network": false,
+                    "available_staking_tools": staking_tools_allowed(kms),
+                },
+                "lookup": staking_account.lookup,
             }))
         }
         Err(error) => McpToolResult::error(-32020, error.to_string()),
@@ -1496,8 +1591,9 @@ mod tests {
     use crate::address::encode_lunes_address_for_tests;
     use crate::config::{AgentMode, PermissionsConfig};
     use crate::lunes_client::{
-        ChainInfo, ChainProperties, NativeBalance, NetworkHealth, RuntimeInfo, TransactionState,
-        TransactionStatus, ValidatorSet,
+        ChainInfo, ChainProperties, NativeBalance, NetworkHealth, Nominations, RuntimeInfo,
+        StakingAccount, StakingLedger, StakingRewardDestination, TransactionState,
+        TransactionStatus, UnlockChunk, ValidatorPrefs, ValidatorSet,
     };
 
     fn lunes_address(seed: u8) -> String {
@@ -1779,6 +1875,71 @@ mod tests {
         assert_eq!(data["active_validator_count"], 2);
         assert_eq!(data["agent_policy"]["can_manage_staking"], true);
         assert_eq!(data["write_status"], "prepare_or_local_intent_only");
+    }
+
+    #[tokio::test]
+    async fn get_staking_account_returns_live_staking_fields() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let stash = lunes_address(8);
+        let controller = lunes_address(9);
+        let target = lunes_address(10);
+        let client = LunesClient::static_staking_account(StakingAccount {
+            address: stash.clone(),
+            stash_address: stash.clone(),
+            controller_address: Some(controller.clone()),
+            bonded: true,
+            roles: vec!["bonded".into(), "validator".into()],
+            ledger: Some(StakingLedger {
+                stash_account_id: [8u8; 32],
+                stash_address: stash.clone(),
+                total_base_units: 5_000_000_000_000,
+                active_base_units: 4_000_000_000_000,
+                unlocking_or_inactive_base_units: 1_000_000_000_000,
+                unlocking: vec![UnlockChunk {
+                    value_base_units: 1_000_000_000_000,
+                    era: 120,
+                }],
+                claimed_rewards: vec![100, 101],
+                raw_extra_bytes: 0,
+            }),
+            reward_destination: Some(StakingRewardDestination {
+                destination: "staked".into(),
+                account: None,
+            }),
+            nominations: Some(Nominations {
+                targets: vec![target],
+                submitted_in: Some(77),
+                suppressed: Some(false),
+            }),
+            validator_prefs: Some(ValidatorPrefs {
+                commission_perbill: 390_625,
+                commission_percent: "0.0391".into(),
+                blocked: false,
+            }),
+            lookup: "live_lunes_rpc_staking_storage".into(),
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_staking_account".into(),
+                arguments: serde_json::json!({ "address": stash }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["bonded"], true);
+        assert_eq!(data["roles"][1], "validator");
+        assert_eq!(data["ledger"]["total_lunes"], "50000");
+        assert_eq!(data["ledger"]["unlocking"][0]["value_lunes"], "10000");
+        assert_eq!(data["ledger"]["unlocking"][0]["era"], 120);
+        assert_eq!(data["reward_destination"]["destination"], "staked");
+        assert_eq!(data["nominations"]["target_count"], 1);
+        assert_eq!(data["validator_prefs"]["commission_perbill"], 390_625);
+        assert_eq!(data["agent_actions"]["can_prepare_staking_actions"], true);
     }
 
     #[tokio::test]
@@ -2083,7 +2244,7 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
         assert!(tools
             .iter()
@@ -2100,6 +2261,9 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_staking_overview"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_staking_account"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_chain_info"));

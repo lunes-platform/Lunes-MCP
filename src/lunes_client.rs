@@ -28,6 +28,7 @@ pub struct LunesClient {
     static_account_next_index: Option<u64>,
     static_network_health: Option<NetworkHealth>,
     static_validator_set: Option<ValidatorSet>,
+    static_staking_account: Option<StakingAccount>,
 }
 
 impl LunesClient {
@@ -44,6 +45,7 @@ impl LunesClient {
             static_account_next_index: None,
             static_network_health: None,
             static_validator_set: None,
+            static_staking_account: None,
         }
     }
 
@@ -58,6 +60,7 @@ impl LunesClient {
             static_account_next_index: None,
             static_network_health: None,
             static_validator_set: None,
+            static_staking_account: None,
         }
     }
 
@@ -72,6 +75,7 @@ impl LunesClient {
             static_account_next_index: None,
             static_network_health: None,
             static_validator_set: None,
+            static_staking_account: None,
         }
     }
 
@@ -86,6 +90,7 @@ impl LunesClient {
             static_account_next_index: Some(account_next_index),
             static_network_health: None,
             static_validator_set: None,
+            static_staking_account: None,
         }
     }
 
@@ -100,6 +105,7 @@ impl LunesClient {
             static_account_next_index: None,
             static_network_health: None,
             static_validator_set: None,
+            static_staking_account: None,
         }
     }
 
@@ -114,6 +120,7 @@ impl LunesClient {
             static_account_next_index: None,
             static_network_health: Some(health),
             static_validator_set: None,
+            static_staking_account: None,
         }
     }
 
@@ -128,6 +135,22 @@ impl LunesClient {
             static_account_next_index: None,
             static_network_health: None,
             static_validator_set: Some(validator_set),
+            static_staking_account: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_staking_account(staking_account: StakingAccount) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+            static_staking_account: Some(staking_account),
         }
     }
 
@@ -207,6 +230,26 @@ impl LunesClient {
         for endpoint in self.endpoints.iter() {
             match fetch_validator_set(endpoint).await {
                 Ok(validator_set) => return Ok(validator_set),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    pub async fn staking_account(
+        &self,
+        address: &str,
+        account_id: [u8; 32],
+    ) -> Result<StakingAccount, LunesClientError> {
+        if let Some(staking_account) = &self.static_staking_account {
+            return Ok(staking_account.clone());
+        }
+
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match fetch_staking_account(endpoint, address, &account_id).await {
+                Ok(staking_account) => return Ok(staking_account),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -365,6 +408,100 @@ async fn fetch_validator_set(endpoint: &str) -> Result<ValidatorSet, LunesClient
         lookup: "session.validators".into(),
         validators,
     })
+}
+
+async fn fetch_staking_account(
+    endpoint: &str,
+    address: &str,
+    account_id: &[u8; 32],
+) -> Result<StakingAccount, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let bonded_storage =
+        staking_storage_for_account(&client, "Bonded", StorageHasher::Twox64Concat, account_id)
+            .await?;
+    let bonded_controller = bonded_storage
+        .as_deref()
+        .map(decode_account_id)
+        .transpose()?;
+    let controller_account_id = bonded_controller.unwrap_or(*account_id);
+
+    let ledger_storage = staking_storage_for_account(
+        &client,
+        "Ledger",
+        StorageHasher::Blake2_128Concat,
+        &controller_account_id,
+    )
+    .await?;
+    let ledger = ledger_storage
+        .as_deref()
+        .map(decode_staking_ledger)
+        .transpose()?;
+    let stash_account_id = ledger
+        .as_ref()
+        .map(|ledger| ledger.stash_account_id)
+        .unwrap_or(*account_id);
+
+    let payee_storage = staking_storage_for_account(
+        &client,
+        "Payee",
+        StorageHasher::Twox64Concat,
+        &stash_account_id,
+    )
+    .await?;
+    let reward_destination = payee_storage
+        .as_deref()
+        .map(decode_reward_destination)
+        .transpose()?;
+
+    let nominations_storage = staking_storage_for_account(
+        &client,
+        "Nominators",
+        StorageHasher::Twox64Concat,
+        &stash_account_id,
+    )
+    .await?;
+    let nominations = nominations_storage
+        .as_deref()
+        .map(decode_nominations)
+        .transpose()?;
+
+    let validator_storage = staking_storage_for_account(
+        &client,
+        "Validators",
+        StorageHasher::Twox64Concat,
+        &stash_account_id,
+    )
+    .await?;
+    let validator_prefs = validator_storage
+        .as_deref()
+        .map(decode_validator_prefs)
+        .transpose()?;
+
+    let has_bond = bonded_storage.is_some() || ledger.is_some();
+    let roles = staking_roles(has_bond, nominations.is_some(), validator_prefs.is_some());
+
+    Ok(StakingAccount {
+        address: address.to_string(),
+        stash_address: encode_lunes_address(stash_account_id),
+        controller_address: has_bond.then(|| encode_lunes_address(controller_account_id)),
+        bonded: has_bond,
+        roles,
+        ledger,
+        reward_destination,
+        nominations,
+        validator_prefs,
+        lookup: "live_lunes_rpc_staking_storage".into(),
+    })
+}
+
+async fn staking_storage_for_account(
+    client: &WsClient,
+    item: &str,
+    hasher: StorageHasher,
+    account_id: &[u8; 32],
+) -> Result<Option<String>, LunesClientError> {
+    let key = storage_map_key("Staking", item, hasher, account_id);
+    rpc_request_params(client, "state_getStorage", vec![Value::String(key)]).await
 }
 
 async fn fetch_transaction_status(
@@ -644,6 +781,59 @@ pub struct ValidatorSet {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StakingAccount {
+    pub address: String,
+    pub stash_address: String,
+    pub controller_address: Option<String>,
+    pub bonded: bool,
+    pub roles: Vec<String>,
+    pub ledger: Option<StakingLedger>,
+    pub reward_destination: Option<StakingRewardDestination>,
+    pub nominations: Option<Nominations>,
+    pub validator_prefs: Option<ValidatorPrefs>,
+    pub lookup: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StakingLedger {
+    #[serde(skip)]
+    pub stash_account_id: [u8; 32],
+    pub stash_address: String,
+    pub total_base_units: u128,
+    pub active_base_units: u128,
+    pub unlocking_or_inactive_base_units: u128,
+    pub unlocking: Vec<UnlockChunk>,
+    pub claimed_rewards: Vec<u32>,
+    pub raw_extra_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UnlockChunk {
+    pub value_base_units: u128,
+    pub era: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StakingRewardDestination {
+    pub destination: String,
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Nominations {
+    pub targets: Vec<String>,
+    pub submitted_in: Option<u32>,
+    pub suppressed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ValidatorPrefs {
+    pub commission_perbill: u32,
+    pub commission_percent: String,
+    pub blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TransactionStatus {
     pub tx_hash: String,
     pub status: TransactionState,
@@ -884,6 +1074,32 @@ fn storage_prefix_key(pallet: &str, item: &str) -> String {
     format!("0x{}", hex::encode(key))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StorageHasher {
+    Twox64Concat,
+    Blake2_128Concat,
+}
+
+fn storage_map_key(
+    pallet: &str,
+    item: &str,
+    hasher: StorageHasher,
+    key_payload: &[u8; 32],
+) -> String {
+    let mut key = hex_to_bytes(&storage_prefix_key(pallet, item)).expect("storage prefix is hex");
+    match hasher {
+        StorageHasher::Twox64Concat => {
+            key.extend_from_slice(&xxhash64(key_payload, 0).to_le_bytes());
+            key.extend_from_slice(key_payload);
+        }
+        StorageHasher::Blake2_128Concat => {
+            key.extend_from_slice(&blake2_hash::<16>(key_payload));
+            key.extend_from_slice(key_payload);
+        }
+    }
+    format!("0x{}", hex::encode(key))
+}
+
 fn twox128(input: &[u8]) -> [u8; 16] {
     let first = xxhash64(input, 0).to_le_bytes();
     let second = xxhash64(input, 1).to_le_bytes();
@@ -1052,6 +1268,265 @@ fn decode_compact_u32(bytes: &[u8]) -> Result<(u32, usize), LunesClientError> {
         _ => Err(LunesClientError::InvalidRpcResponse(
             "large compact lengths are not supported".into(),
         )),
+    }
+}
+
+fn decode_account_id(storage: &str) -> Result<[u8; 32], LunesClientError> {
+    let bytes = hex_to_bytes(storage)?;
+    account_id_from_slice(&bytes)
+}
+
+fn account_id_from_slice(bytes: &[u8]) -> Result<[u8; 32], LunesClientError> {
+    let raw = bytes
+        .get(..32)
+        .ok_or_else(|| LunesClientError::InvalidRpcResponse("missing account id".into()))?;
+    let mut account_id = [0u8; 32];
+    account_id.copy_from_slice(raw);
+    Ok(account_id)
+}
+
+fn decode_staking_ledger(storage: &str) -> Result<StakingLedger, LunesClientError> {
+    let bytes = hex_to_bytes(storage)?;
+    if bytes.len() < 34 {
+        return Err(LunesClientError::InvalidRpcResponse(format!(
+            "staking ledger storage is too short: {} bytes",
+            bytes.len()
+        )));
+    }
+
+    let stash_account_id = account_id_from_slice(&bytes)?;
+    let mut offset = 32;
+    let (total_base_units, total_offset) = decode_compact_u128_at(&bytes, offset)?;
+    offset = total_offset;
+    let (active_base_units, active_offset) = decode_compact_u128_at(&bytes, offset)?;
+    offset = active_offset;
+
+    let (unlocking, claimed_rewards, raw_extra_bytes) = decode_ledger_extra(&bytes[offset..]);
+
+    Ok(StakingLedger {
+        stash_account_id,
+        stash_address: encode_lunes_address(stash_account_id),
+        total_base_units,
+        active_base_units,
+        unlocking_or_inactive_base_units: total_base_units.saturating_sub(active_base_units),
+        unlocking,
+        claimed_rewards,
+        raw_extra_bytes,
+    })
+}
+
+fn decode_ledger_extra(bytes: &[u8]) -> (Vec<UnlockChunk>, Vec<u32>, usize) {
+    if bytes.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+
+    if bytes.len() == 2 && bytes == [0, 0] {
+        return (Vec::new(), Vec::new(), 0);
+    }
+
+    if let Ok((unlocking, offset)) = decode_unlock_chunks(bytes) {
+        if offset == bytes.len() {
+            return (unlocking, Vec::new(), 0);
+        }
+
+        if let Ok((claimed_rewards, claimed_offset)) = decode_u32_vec(&bytes[offset..]) {
+            if offset + claimed_offset == bytes.len() {
+                return (unlocking, claimed_rewards, 0);
+            }
+        }
+    }
+
+    (Vec::new(), Vec::new(), bytes.len())
+}
+
+fn decode_reward_destination(storage: &str) -> Result<StakingRewardDestination, LunesClientError> {
+    let bytes = hex_to_bytes(storage)?;
+    let Some(kind) = bytes.first() else {
+        return Err(LunesClientError::InvalidRpcResponse(
+            "missing reward destination".into(),
+        ));
+    };
+
+    let destination = match kind {
+        0 => "staked",
+        1 => "stash",
+        2 => "controller",
+        3 => "account",
+        4 => "none",
+        _ => "unknown",
+    };
+    let account = if *kind == 3 {
+        let account_id = account_id_from_slice(&bytes[1..])?;
+        Some(encode_lunes_address(account_id))
+    } else {
+        None
+    };
+
+    Ok(StakingRewardDestination {
+        destination: destination.into(),
+        account,
+    })
+}
+
+fn decode_nominations(storage: &str) -> Result<Nominations, LunesClientError> {
+    let bytes = hex_to_bytes(storage)?;
+    let (targets_raw, mut offset) = decode_account_id_vec(&bytes)?;
+    let submitted_in = if bytes.len() >= offset + 4 {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&bytes[offset..offset + 4]);
+        offset += 4;
+        Some(u32::from_le_bytes(raw))
+    } else {
+        None
+    };
+    let suppressed = bytes.get(offset).map(|value| *value != 0);
+
+    Ok(Nominations {
+        targets: targets_raw.into_iter().map(encode_lunes_address).collect(),
+        submitted_in,
+        suppressed,
+    })
+}
+
+fn decode_validator_prefs(storage: &str) -> Result<ValidatorPrefs, LunesClientError> {
+    let bytes = hex_to_bytes(storage)?;
+    let (commission_perbill, offset) = decode_compact_u128_at(&bytes, 0)?;
+    let blocked = bytes.get(offset).map(|value| *value != 0).unwrap_or(false);
+    let commission_perbill = u32::try_from(commission_perbill).map_err(|_| {
+        LunesClientError::InvalidRpcResponse("validator commission is too large".into())
+    })?;
+
+    Ok(ValidatorPrefs {
+        commission_perbill,
+        commission_percent: format_perbill_percent(commission_perbill),
+        blocked,
+    })
+}
+
+fn format_perbill_percent(value: u32) -> String {
+    let scaled = (value as u128 * 1_000_000 + 500_000_000) / 1_000_000_000;
+    let whole = scaled / 10_000;
+    let fractional = scaled % 10_000;
+    format!("{whole}.{fractional:04}")
+}
+
+fn staking_roles(bonded: bool, nominator: bool, validator: bool) -> Vec<String> {
+    let mut roles = Vec::new();
+    if bonded {
+        roles.push("bonded".into());
+    }
+    if nominator {
+        roles.push("nominator".into());
+    }
+    if validator {
+        roles.push("validator".into());
+    }
+    if roles.is_empty() {
+        roles.push("idle".into());
+    }
+    roles
+}
+
+fn decode_account_id_vec(bytes: &[u8]) -> Result<(Vec<[u8; 32]>, usize), LunesClientError> {
+    let (count, mut offset) = decode_compact_u32(bytes)?;
+    let required_len = offset + (count as usize * 32);
+    if bytes.len() < required_len {
+        return Err(LunesClientError::InvalidRpcResponse(
+            "account id vector is truncated".into(),
+        ));
+    }
+
+    let mut accounts = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        accounts.push(account_id_from_slice(&bytes[offset..offset + 32])?);
+        offset += 32;
+    }
+
+    Ok((accounts, offset))
+}
+
+fn decode_u32_vec(bytes: &[u8]) -> Result<(Vec<u32>, usize), LunesClientError> {
+    let (count, mut offset) = decode_compact_u32(bytes)?;
+    let required_len = offset + (count as usize * 4);
+    if bytes.len() < required_len {
+        return Err(LunesClientError::InvalidRpcResponse(
+            "u32 vector is truncated".into(),
+        ));
+    }
+
+    let mut values = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&bytes[offset..offset + 4]);
+        values.push(u32::from_le_bytes(raw));
+        offset += 4;
+    }
+
+    Ok((values, offset))
+}
+
+fn decode_unlock_chunks(bytes: &[u8]) -> Result<(Vec<UnlockChunk>, usize), LunesClientError> {
+    let (count, mut offset) = decode_compact_u32(bytes)?;
+    let mut chunks = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        let (value_base_units, value_offset) = decode_compact_u128_at(bytes, offset)?;
+        offset = value_offset;
+
+        let raw_era = bytes.get(offset..offset + 4).ok_or_else(|| {
+            LunesClientError::InvalidRpcResponse("unlock chunk era is truncated".into())
+        })?;
+        let era = u32::from_le_bytes(raw_era.try_into().expect("slice length checked"));
+        offset += 4;
+
+        chunks.push(UnlockChunk {
+            value_base_units,
+            era,
+        });
+    }
+
+    Ok((chunks, offset))
+}
+
+fn decode_compact_u128_at(bytes: &[u8], offset: usize) -> Result<(u128, usize), LunesClientError> {
+    let Some(first) = bytes.get(offset) else {
+        return Err(LunesClientError::InvalidRpcResponse(
+            "missing compact integer".into(),
+        ));
+    };
+
+    match first & 0b11 {
+        0 => Ok(((first >> 2) as u128, offset + 1)),
+        1 => {
+            let raw = bytes.get(offset..offset + 2).ok_or_else(|| {
+                LunesClientError::InvalidRpcResponse("compact integer is truncated".into())
+            })?;
+            let encoded = u16::from_le_bytes(raw.try_into().expect("slice length checked"));
+            Ok(((encoded >> 2) as u128, offset + 2))
+        }
+        2 => {
+            let raw = bytes.get(offset..offset + 4).ok_or_else(|| {
+                LunesClientError::InvalidRpcResponse("compact integer is truncated".into())
+            })?;
+            let encoded = u32::from_le_bytes(raw.try_into().expect("slice length checked"));
+            Ok(((encoded >> 2) as u128, offset + 4))
+        }
+        _ => {
+            let byte_len = ((first >> 2) + 4) as usize;
+            if byte_len > 16 {
+                return Err(LunesClientError::InvalidRpcResponse(
+                    "compact integer exceeds u128".into(),
+                ));
+            }
+            let raw = bytes
+                .get(offset + 1..offset + 1 + byte_len)
+                .ok_or_else(|| {
+                    LunesClientError::InvalidRpcResponse("compact integer is truncated".into())
+                })?;
+            let mut output = [0u8; 16];
+            output[..byte_len].copy_from_slice(raw);
+            Ok((u128::from_le_bytes(output), offset + 1 + byte_len))
+        }
     }
 }
 
@@ -1239,6 +1714,66 @@ mod tests {
             decode_session_validators(Some(&format!("0x{}", hex::encode(storage)))).unwrap();
 
         assert_eq!(validators, vec![first, second]);
+    }
+
+    #[test]
+    fn decodes_staking_ledger_storage() {
+        let stash = [8u8; 32];
+        let mut storage = stash.to_vec();
+        storage.extend_from_slice(&compact_u128(5_000_000_000_000));
+        storage.extend_from_slice(&compact_u128(4_000_000_000_000));
+        storage.push(1 << 2);
+        storage.extend_from_slice(&compact_u128(1_000_000_000_000));
+        storage.extend_from_slice(&120u32.to_le_bytes());
+        storage.push(2 << 2);
+        storage.extend_from_slice(&100u32.to_le_bytes());
+        storage.extend_from_slice(&101u32.to_le_bytes());
+
+        let ledger = decode_staking_ledger(&format!("0x{}", hex::encode(storage))).unwrap();
+
+        assert_eq!(ledger.stash_account_id, stash);
+        assert_eq!(ledger.total_base_units, 5_000_000_000_000);
+        assert_eq!(ledger.active_base_units, 4_000_000_000_000);
+        assert_eq!(ledger.unlocking_or_inactive_base_units, 1_000_000_000_000);
+        assert_eq!(ledger.unlocking.len(), 1);
+        assert_eq!(ledger.unlocking[0].value_base_units, 1_000_000_000_000);
+        assert_eq!(ledger.unlocking[0].era, 120);
+        assert_eq!(ledger.claimed_rewards, vec![100, 101]);
+        assert_eq!(ledger.raw_extra_bytes, 0);
+    }
+
+    #[test]
+    fn decodes_reward_destination_and_validator_prefs() {
+        let payee = decode_reward_destination("0x00").unwrap();
+        assert_eq!(payee.destination, "staked");
+        assert_eq!(payee.account, None);
+
+        let mut prefs = compact_u128(390_625);
+        prefs.push(0);
+        let prefs = decode_validator_prefs(&format!("0x{}", hex::encode(prefs))).unwrap();
+        assert_eq!(prefs.commission_perbill, 390_625);
+        assert_eq!(prefs.commission_percent, "0.0391");
+        assert!(!prefs.blocked);
+    }
+
+    fn compact_u128(value: u128) -> Vec<u8> {
+        if value < 1 << 6 {
+            return vec![(value as u8) << 2];
+        }
+        if value < 1 << 14 {
+            return (((value as u16) << 2) | 0b01).to_le_bytes().to_vec();
+        }
+        if value < 1 << 30 {
+            return (((value as u32) << 2) | 0b10).to_le_bytes().to_vec();
+        }
+
+        let mut raw = value.to_le_bytes().to_vec();
+        while raw.last() == Some(&0) {
+            raw.pop();
+        }
+        let mut encoded = vec![(((raw.len() - 4) as u8) << 2) | 0b11];
+        encoded.extend(raw);
+        encoded
     }
 
     #[test]

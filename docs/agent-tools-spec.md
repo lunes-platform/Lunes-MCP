@@ -45,6 +45,7 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_get_investment_position` | Read | Summarize liquid and reserved/locked LUNES for staking or treasury planning |
 | `lunes_get_validator_set` | Read | Read the current validator set from live Lunes Network state |
 | `lunes_get_staking_overview` | Read | Summarize validator visibility and the staking actions this agent is allowed to prepare |
+| `lunes_get_staking_account` | Read | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for one Lunes account |
 
 ## Project Structure
 
@@ -99,8 +100,8 @@ Ask first:
 - adding dependencies;
 - changing public tool names or response fields;
 - enabling final Lunes Network transaction submission;
-- expanding staking reads into account-specific ledgers, reward claims, or
-  validator scoring.
+- expanding staking reads into reward payout history, validator scoring, or
+  automated validator selection.
 
 Never:
 
@@ -120,4 +121,7 @@ Never:
 - `lunes_get_validator_set` reads validator addresses from live network state.
 - `lunes_get_staking_overview` combines validator visibility with local policy
   boundaries.
+- `lunes_get_staking_account` returns live staking state, including unlocking
+  chunks, for bonded, nominator, validator, and idle accounts without signing
+  or broadcasting.
 - All verification commands pass before publishing.

@@ -51,12 +51,19 @@ struct McpContext {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing with optional RUST_LOG filters.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Use JSON formatting if in production.
+    let is_prod = std::env::var("ENVIRONMENT").unwrap_or_default() == "production";
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if is_prod {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     info!("Lunes MCP Server");
     info!("Secure agent gateway for Lunes Network tooling");
