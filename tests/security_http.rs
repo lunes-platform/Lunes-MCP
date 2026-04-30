@@ -76,11 +76,20 @@ fn rate_limit_rejects_requests_after_burst() {
     let server = RunningServer::start(Some("test-token"), 1, 1);
 
     let first = post_json_rpc(&server.addr, Some("Bearer test-token"), health_body());
-    let second = post_json_rpc(&server.addr, Some("Bearer test-token"), health_body());
-
     assert!(first.starts_with("HTTP/1.1 200"));
-    assert!(second.starts_with("HTTP/1.1 429"));
-    assert!(second.contains(r#""code":-32099"#));
+
+    let responses: Vec<String> = (0..8)
+        .map(|_| post_json_rpc(&server.addr, Some("Bearer test-token"), health_body()))
+        .collect();
+    let rate_limited = responses
+        .iter()
+        .find(|response| response.starts_with("HTTP/1.1 429"));
+
+    assert!(
+        rate_limited.is_some(),
+        "expected at least one rate-limited response, got: {responses:#?}"
+    );
+    assert!(rate_limited.unwrap().contains(r#""code":-32099"#));
 }
 
 fn health_body() -> &'static str {

@@ -34,7 +34,7 @@ The `.gitignore` blocks these patterns by default.
 
 - Blockchain calls are not yet backed by a real Lunes Network client.
 - SS58 validation is syntactic and does not yet verify checksum/prefix.
-- Autonomous signatures are local intent payload signatures, not final SCALE extrinsic signatures.
+- Autonomous signatures are local intent payload signatures, not final Lunes Network transaction signatures.
 - Autonomous `contracts.call` is disabled until message allowlists and asset-specific limits exist.
 - Audit logs are in memory only.
 

@@ -85,7 +85,8 @@ impl McpToolResult {
 // --- SS58 address validation --------------------------------------------
 
 /// Basic SS58 address validation for Lunes-compatible addresses.
-/// Checks length and base58 characters only; checksum validation needs subxt.
+/// Checks length and base58 characters only.
+/// Checksum validation needs Lunes Network RPC integration.
 fn is_valid_ss58(address: &str) -> bool {
     if address.len() < 46 || address.len() > 48 {
         return false;
