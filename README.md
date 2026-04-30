@@ -29,6 +29,7 @@ operator review. It does not yet broadcast final Lunes Network transactions.
 - [Configuration](#configuration)
 - [Client Setup](#client-setup)
 - [Tools](#tools)
+- [Specifications](#specifications)
 - [Operations](#operations)
 - [Development](#development)
 - [Security](#security)
@@ -43,7 +44,7 @@ operator review. It does not yet broadcast final Lunes Network transactions.
 | Authentication | `Authorization: Bearer <token>` or `x-lunes-mcp-api-key: <token>` |
 | Guardrails | allowed extrinsics, destination whitelist, TTL, daily spend limit |
 | Runtime checks | request size limit, response size limit, connection cap, rate limiting |
-| Network status | live metadata, native balances, archive-assisted transaction lookup; submission is not enabled yet |
+| Network status | live metadata, health, native balances, validator set, and archive-assisted transaction lookup; submission is not enabled yet |
 
 ### Safety Model
 
@@ -64,10 +65,12 @@ action passes through explicit server-side policy.
 
 | Capability | What the agent can do |
 | --- | --- |
-| Account visibility | Read native LUNES balances through live Lunes Network RPC |
-| Network awareness | Read live Lunes Network metadata, token settings, address format, and runtime version |
+| Account visibility | Read native LUNES balances, nonce, spendable amount, and policy context through live Lunes Network RPC |
+| Network awareness | Read live Lunes Network metadata, health, peers, finality lag, token settings, address format, and runtime version |
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
 | Transaction awareness | Check pending pool, current heads, and the archive endpoint for a transaction hash |
+| Validator visibility | Read the current validator set and expose bounded samples to agents |
+| Investment planning | Summarize liquid and reserved/locked LUNES for conservative staking or treasury planning |
 | Staking management | Prepare bond, unbond, withdraw, nominate, chill, and reward-destination updates |
 | Contract discovery | Look up ink! contract metadata through the Lunes tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
@@ -84,6 +87,7 @@ configured permission model.
 - Wallet operations inside agent tools without exposing private keys to the agent.
 - Address validation and permission checks before an agent proposes an irreversible action.
 - Staking and investment workflows where every operation is bounded by allowlists and review.
+- Validator discovery and account liquidity checks before a staking plan is proposed.
 - Human-reviewed transfer preparation for support, treasury, or operations teams.
 - Read-only account and transaction assistance in Claude Code, Codex, Cursor, Windsurf, and similar environments.
 - Bounded local automation for test flows where destination, extrinsic, TTL, and spend limits are explicitly configured.
@@ -363,6 +367,11 @@ use a client with HTTP MCP transport support.
 | Tool | Type | Description |
 | --- | --- | --- |
 | `lunes_get_balance` | Read | Reads native LUNES balance data through live Lunes Network RPC; PSP22 lookup remains future work |
+| `lunes_get_network_health` | Read | Reads live peer count, sync status, head/finality lag, pending pool size, and RPC surface size |
+| `lunes_get_account_overview` | Read | Reads account nonce, native balances, spendable amount, and active agent policy |
+| `lunes_get_investment_position` | Read | Summarizes liquid and reserved/locked LUNES for staking or treasury planning |
+| `lunes_get_validator_set` | Read | Reads the current validator set from live Lunes Network state |
+| `lunes_get_staking_overview` | Read | Summarizes validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_chain_info` | Read | Reads live Lunes Network metadata, token settings, address format, and runtime version |
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
@@ -382,6 +391,11 @@ use a client with HTTP MCP transport support.
 
 Write tools are checked against policy before signing. Responses include
 `broadcasted: false` until Lunes Network submission is implemented.
+
+## Specifications
+
+The public tool contract for agent-facing Lunes Network reads is documented in
+[`docs/agent-tools-spec.md`](docs/agent-tools-spec.md).
 
 ## Operations
 

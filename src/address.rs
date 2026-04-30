@@ -73,13 +73,17 @@ fn ss58_checksum(payload: &[u8]) -> [u8; CHECKSUM_LEN] {
     [output[0], output[1]]
 }
 
-#[cfg(test)]
-pub fn encode_lunes_address_for_tests(account_id: [u8; ACCOUNT_ID_LEN]) -> String {
+pub fn encode_lunes_address(account_id: [u8; ACCOUNT_ID_LEN]) -> String {
     let mut payload = Vec::with_capacity(1 + ACCOUNT_ID_LEN + CHECKSUM_LEN);
     payload.push(LUNES_SS58_PREFIX as u8);
     payload.extend_from_slice(&account_id);
     payload.extend_from_slice(&ss58_checksum(&payload));
     bs58::encode(payload).into_string()
+}
+
+#[cfg(test)]
+pub fn encode_lunes_address_for_tests(account_id: [u8; ACCOUNT_ID_LEN]) -> String {
+    encode_lunes_address(account_id)
 }
 
 #[cfg(test)]

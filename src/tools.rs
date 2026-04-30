@@ -24,6 +24,8 @@ const LUNES_DECIMALS: u32 = 8;
 const LUNES_BASE_UNITS: u128 = 100_000_000;
 const STAKING_POLICY_DESTINATION: &str = "staking";
 const MAX_NOMINATIONS: usize = 16;
+const DEFAULT_VALIDATOR_LIMIT: usize = 16;
+const MAX_VALIDATOR_LIMIT: usize = 64;
 
 // --- MCP-compatible response schemas ------------------------------------
 
@@ -128,7 +130,13 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_search_contract" => handle_search_contract(&request.arguments),
         "lunes_validate_address" => handle_validate_address(&request.arguments),
         "lunes_get_permissions" => handle_get_permissions(kms),
-        "lunes_get_balance" | "lunes_get_transaction_status" => {
+        "lunes_get_balance"
+        | "lunes_get_transaction_status"
+        | "lunes_get_network_health"
+        | "lunes_get_account_overview"
+        | "lunes_get_investment_position"
+        | "lunes_get_validator_set"
+        | "lunes_get_staking_overview" => {
             McpToolResult::error(-32020, "Tool requires a live Lunes RPC client".into())
         }
 
@@ -158,7 +166,20 @@ pub async fn dispatch_tool_call_with_chain(
 ) -> McpToolResult {
     match request.name.as_str() {
         "lunes_get_chain_info" => handle_get_chain_info(lunes_client).await,
+        "lunes_get_network_health" => handle_get_network_health(lunes_client).await,
         "lunes_get_balance" => handle_get_balance(&request.arguments, lunes_client).await,
+        "lunes_get_account_overview" => {
+            handle_get_account_overview(&request.arguments, kms, lunes_client).await
+        }
+        "lunes_get_investment_position" => {
+            handle_get_investment_position(&request.arguments, kms, lunes_client).await
+        }
+        "lunes_get_validator_set" => {
+            handle_get_validator_set(&request.arguments, lunes_client).await
+        }
+        "lunes_get_staking_overview" => {
+            handle_get_staking_overview(&request.arguments, kms, lunes_client).await
+        }
         "lunes_get_transaction_status" => {
             handle_get_tx_status(&request.arguments, lunes_client).await
         }
@@ -179,6 +200,66 @@ pub fn tool_definitions() -> Vec<Value> {
                     "asset_id": { "type": "string", "description": "PSP22 contract address. Omit for native LUNES." }
                 },
                 "required": ["address"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_network_health",
+            "description": "Read live Lunes Network health, peer count, head/finality lag, and pending pool size.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_account_overview",
+            "description": "Read an account overview with native LUNES balances, nonce, spendable amount, and active agent policy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "SS58 address on Lunes Network." }
+                },
+                "required": ["address"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_investment_position",
+            "description": "Summarize liquid, reserved, and locked LUNES for agent-assisted staking and investment planning.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "SS58 address on Lunes Network." }
+                },
+                "required": ["address"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_validator_set",
+            "description": "Read the current Lunes validator set from live network state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_VALIDATOR_LIMIT,
+                        "description": "Maximum validator addresses to return. Defaults to 16."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_staking_overview",
+            "description": "Summarize live staking visibility and the staking actions this agent is allowed to prepare.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "validator_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_VALIDATOR_LIMIT,
+                        "description": "Maximum validator addresses to include in the sample. Defaults to 16."
+                    }
+                }
             }
         }),
         serde_json::json!({
@@ -428,6 +509,189 @@ async fn handle_get_balance(args: &Value, lunes_client: &LunesClient) -> McpTool
     }
 }
 
+async fn handle_get_network_health(lunes_client: &LunesClient) -> McpToolResult {
+    match lunes_client.network_health().await {
+        Ok(health) => McpToolResult::success(serde_json::json!({
+            "status": health.status(),
+            "endpoint": health.endpoint,
+            "network": health.chain,
+            "node": {
+                "name": health.node_name,
+                "version": health.node_version,
+            },
+            "peers": health.peers,
+            "is_syncing": health.is_syncing,
+            "should_have_peers": health.should_have_peers,
+            "best_block": {
+                "hash": health.best_block_hash,
+                "number": health.best_block_number,
+            },
+            "finalized_block": {
+                "hash": health.finalized_block_hash,
+                "number": health.finalized_block_number,
+            },
+            "finality_lag_blocks": health.finality_lag_blocks(),
+            "pending_extrinsics": health.pending_extrinsics,
+            "rpc_methods": health.rpc_methods,
+            "lookup": "live_lunes_rpc",
+        })),
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+async fn handle_get_account_overview(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    let parsed = match parse_lunes_address(address, "address") {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+
+    let balance = match lunes_client.native_balance(parsed.account_id).await {
+        Ok(balance) => balance,
+        Err(error) => return McpToolResult::error(-32020, error.to_string()),
+    };
+    let nonce = match lunes_client.account_next_index(address).await {
+        Ok(nonce) => nonce,
+        Err(error) => return McpToolResult::error(-32020, error.to_string()),
+    };
+
+    McpToolResult::success(serde_json::json!({
+        "address": address,
+        "account_id_hex": hex::encode(parsed.account_id),
+        "nonce": nonce,
+        "asset": native_asset_json(),
+        "balances": native_balance_json(balance),
+        "policy": agent_policy_json(kms),
+        "lookup": "live_lunes_rpc",
+    }))
+}
+
+async fn handle_get_investment_position(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    let address = args.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    let parsed = match parse_lunes_address(address, "address") {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+
+    let balance = match lunes_client.native_balance(parsed.account_id).await {
+        Ok(balance) => balance,
+        Err(error) => return McpToolResult::error(-32020, error.to_string()),
+    };
+    let nonce = match lunes_client.account_next_index(address).await {
+        Ok(nonce) => nonce,
+        Err(error) => return McpToolResult::error(-32020, error.to_string()),
+    };
+
+    let liquid = balance.free.saturating_sub(balance.frozen);
+    let reserved_or_locked = balance.reserved.saturating_add(balance.frozen);
+    let can_manage_staking = can_manage_staking(kms);
+    let can_prepare_writes = can_prepare_writes(kms);
+
+    McpToolResult::success(serde_json::json!({
+        "address": address,
+        "nonce": nonce,
+        "asset": native_asset_json(),
+        "position": {
+            "liquid_base_units": liquid.to_string(),
+            "liquid_lunes": format_lunes_amount(liquid),
+            "reserved_or_locked_base_units": reserved_or_locked.to_string(),
+            "reserved_or_locked_lunes": format_lunes_amount(reserved_or_locked),
+            "free_lunes": format_lunes_amount(balance.free),
+            "reserved_lunes": format_lunes_amount(balance.reserved),
+            "frozen_lunes": format_lunes_amount(balance.frozen),
+        },
+        "agent_actions": {
+            "can_prepare_staking_actions": can_prepare_writes && can_manage_staking,
+            "can_sign_local_intents": kms.is_autonomous() && kms.is_active(),
+            "can_broadcast_to_lunes_network": false,
+            "available_staking_tools": staking_tools_allowed(kms),
+        },
+        "risk_notes": [
+            "This is a read-only position summary, not financial advice.",
+            "Staking operations remain prepare-only or local-intent signed until final Lunes Network transaction submission is implemented.",
+            "Validator choices should be reviewed by a human and constrained through the whitelist."
+        ],
+        "lookup": "live_lunes_rpc",
+    }))
+}
+
+async fn handle_get_validator_set(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let limit = match validator_limit_arg(args, "limit") {
+        Ok(limit) => limit,
+        Err(error) => return error,
+    };
+
+    match lunes_client.validator_set().await {
+        Ok(validator_set) => {
+            let validator_count = validator_set.validators.len();
+            let validators = validator_set
+                .validators
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            McpToolResult::success(serde_json::json!({
+                "lookup": validator_set.lookup,
+                "validator_count": validator_count,
+                "returned": validators.len(),
+                "limit": limit,
+                "truncated": validator_count > validators.len(),
+                "validators": validators,
+            }))
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+async fn handle_get_staking_overview(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    let validator_limit = match validator_limit_arg(args, "validator_limit") {
+        Ok(limit) => limit,
+        Err(error) => return error,
+    };
+
+    match lunes_client.validator_set().await {
+        Ok(validator_set) => {
+            let active_validator_count = validator_set.validators.len();
+            let validator_sample = validator_set
+                .validators
+                .iter()
+                .take(validator_limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            McpToolResult::success(serde_json::json!({
+                "lookup": validator_set.lookup,
+                "active_validator_count": active_validator_count,
+                "validator_sample": validator_sample,
+                "validator_sample_limit": validator_limit,
+                "agent_policy": agent_policy_json(kms),
+                "allowed_staking_tools": staking_tools_allowed(kms),
+                "write_status": "prepare_or_local_intent_only",
+                "broadcast_enabled": false,
+                "next_live_reads": [
+                    "staking ledger",
+                    "active nominations",
+                    "reward destination",
+                    "unbonding schedule",
+                    "validator commission and exposure"
+                ],
+            }))
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
 /// `lunes_get_transaction_status` - reads transaction status by hash.
 async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
     let tx_hash = args.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("");
@@ -584,30 +848,38 @@ fn parse_lunes_address(
     })
 }
 
+fn native_asset_json() -> Value {
+    serde_json::json!({
+        "type": "native",
+        "symbol": "LUNES",
+        "decimals": LUNES_DECIMALS,
+    })
+}
+
+fn native_balance_json(balance: NativeBalance) -> Value {
+    let spendable = balance.free.saturating_sub(balance.frozen);
+    serde_json::json!({
+        "free_base_units": balance.free.to_string(),
+        "reserved_base_units": balance.reserved.to_string(),
+        "frozen_base_units": balance.frozen.to_string(),
+        "spendable_base_units": spendable.to_string(),
+        "free_lunes": format_lunes_amount(balance.free),
+        "reserved_lunes": format_lunes_amount(balance.reserved),
+        "frozen_lunes": format_lunes_amount(balance.frozen),
+        "spendable_lunes": format_lunes_amount(spendable),
+    })
+}
+
 fn native_balance_response(address: &str, balance: NativeBalance) -> McpToolResult {
     let spendable = balance.free.saturating_sub(balance.frozen);
-
     McpToolResult::success(serde_json::json!({
         "address": address,
-        "asset": {
-            "type": "native",
-            "symbol": "LUNES",
-            "decimals": LUNES_DECIMALS,
-        },
+        "asset": native_asset_json(),
         "free_balance": balance.free.to_string(),
         "reserved_balance": balance.reserved.to_string(),
         "frozen_balance": balance.frozen.to_string(),
         "spendable_balance": spendable.to_string(),
-        "balances": {
-            "free_base_units": balance.free.to_string(),
-            "reserved_base_units": balance.reserved.to_string(),
-            "frozen_base_units": balance.frozen.to_string(),
-            "spendable_base_units": spendable.to_string(),
-            "free_lunes": format_lunes_amount(balance.free),
-            "reserved_lunes": format_lunes_amount(balance.reserved),
-            "frozen_lunes": format_lunes_amount(balance.frozen),
-            "spendable_lunes": format_lunes_amount(spendable),
-        },
+        "balances": native_balance_json(balance),
         "lookup": "live_lunes_rpc",
     }))
 }
@@ -626,15 +898,73 @@ fn format_lunes_amount(value: u128) -> String {
     format!("{whole}.{fractional}")
 }
 
-fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
+fn can_prepare_writes(kms: &AgentKms) -> bool {
     let permissions = kms.permissions();
-    let is_autonomous = kms.is_autonomous();
+    !permissions.allowed_extrinsics.is_empty() && !permissions.whitelisted_addresses.is_empty()
+}
+
+fn can_manage_staking(kms: &AgentKms) -> bool {
+    kms.permissions()
+        .allowed_extrinsics
+        .iter()
+        .any(|extrinsic| extrinsic.starts_with("staking."))
+}
+
+fn staking_tools_allowed(kms: &AgentKms) -> Vec<String> {
+    kms.permissions()
+        .allowed_extrinsics
+        .iter()
+        .filter(|extrinsic| extrinsic.starts_with("staking."))
+        .cloned()
+        .collect()
+}
+
+fn agent_policy_json(kms: &AgentKms) -> Value {
+    let permissions = kms.permissions();
     let can_prepare_writes =
         !permissions.allowed_extrinsics.is_empty() && !permissions.whitelisted_addresses.is_empty();
     let can_manage_staking = permissions
         .allowed_extrinsics
         .iter()
         .any(|extrinsic| extrinsic.starts_with("staking."));
+
+    serde_json::json!({
+        "mode": format!("{:?}", kms.mode()),
+        "kms_active": kms.is_active(),
+        "can_prepare_writes": can_prepare_writes,
+        "can_manage_staking": can_manage_staking,
+        "can_sign_local_intents": kms.is_autonomous() && kms.is_active(),
+        "can_broadcast_to_lunes_network": false,
+        "allowed_extrinsics": permissions.allowed_extrinsics,
+        "whitelisted_addresses": permissions.whitelisted_addresses,
+        "daily_limit_lunes": permissions.daily_limit_lunes,
+        "spent_today_lunes": kms.spent_today(),
+        "remaining_today_lunes": permissions.daily_limit_lunes.saturating_sub(kms.spent_today()),
+        "ttl_hours": permissions.ttl_hours,
+    })
+}
+
+fn validator_limit_arg(args: &Value, field_name: &str) -> Result<usize, McpToolResult> {
+    let limit = args
+        .get(field_name)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DEFAULT_VALIDATOR_LIMIT as u64);
+
+    if limit == 0 || limit > MAX_VALIDATOR_LIMIT as u64 {
+        return Err(McpToolResult::error(
+            -32001,
+            format!("{field_name} must be between 1 and {MAX_VALIDATOR_LIMIT}"),
+        ));
+    }
+
+    Ok(limit as usize)
+}
+
+fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
+    let permissions = kms.permissions();
+    let is_autonomous = kms.is_autonomous();
+    let can_prepare_writes = can_prepare_writes(kms);
+    let can_manage_staking = can_manage_staking(kms);
 
     let signing_status = if is_autonomous {
         "local intent signing is enabled after policy checks"
@@ -1166,7 +1496,8 @@ mod tests {
     use crate::address::encode_lunes_address_for_tests;
     use crate::config::{AgentMode, PermissionsConfig};
     use crate::lunes_client::{
-        ChainInfo, ChainProperties, NativeBalance, RuntimeInfo, TransactionState, TransactionStatus,
+        ChainInfo, ChainProperties, NativeBalance, NetworkHealth, RuntimeInfo, TransactionState,
+        TransactionStatus, ValidatorSet,
     };
 
     fn lunes_address(seed: u8) -> String {
@@ -1297,6 +1628,157 @@ mod tests {
         let data = response_json(&response);
         assert_eq!(data["asset"]["type"], "psp22");
         assert_eq!(data["status"], "pending_implementation");
+    }
+
+    #[tokio::test]
+    async fn get_network_health_returns_live_status_shape() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_network_health(NetworkHealth {
+            endpoint: "wss://ws.lunes.io".into(),
+            chain: "Lunes Nigthly".into(),
+            node_name: "Lunes Nightly".into(),
+            node_version: "4.0.0-dev".into(),
+            peers: 12,
+            is_syncing: false,
+            should_have_peers: true,
+            best_block_hash: format!("0x{}", "aa".repeat(32)),
+            best_block_number: 100,
+            finalized_block_hash: format!("0x{}", "bb".repeat(32)),
+            finalized_block_number: 98,
+            pending_extrinsics: 2,
+            rpc_methods: 90,
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_network_health".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["status"], "healthy");
+        assert_eq!(data["finality_lag_blocks"], 2);
+        assert_eq!(data["peers"], 12);
+    }
+
+    #[tokio::test]
+    async fn get_account_overview_combines_balance_nonce_and_policy() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let client = LunesClient::static_account_state(
+            NativeBalance {
+                free: 2_500_000_000,
+                reserved: 500_000_000,
+                frozen: 200_000_000,
+                flags: 0,
+            },
+            7,
+        );
+        let address = lunes_address(4);
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_account_overview".into(),
+                arguments: serde_json::json!({ "address": address }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["nonce"], 7);
+        assert_eq!(data["balances"]["free_lunes"], "25");
+        assert_eq!(data["balances"]["spendable_lunes"], "23");
+        assert_eq!(data["policy"]["can_manage_staking"], true);
+    }
+
+    #[tokio::test]
+    async fn get_investment_position_reports_liquidity_and_actions() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let client = LunesClient::static_account_state(
+            NativeBalance {
+                free: 1_000_000_000,
+                reserved: 300_000_000,
+                frozen: 100_000_000,
+                flags: 0,
+            },
+            3,
+        );
+        let address = lunes_address(5);
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_investment_position".into(),
+                arguments: serde_json::json!({ "address": address }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["position"]["liquid_lunes"], "9");
+        assert_eq!(data["position"]["reserved_or_locked_lunes"], "4");
+        assert!(data["agent_actions"]["can_prepare_staking_actions"]
+            .as_bool()
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_validator_set_respects_limit() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_validator_set(ValidatorSet {
+            lookup: "session.validators".into(),
+            validators: vec![lunes_address(1), lunes_address(2), lunes_address(3)],
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_validator_set".into(),
+                arguments: serde_json::json!({ "limit": 2 }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["validator_count"], 3);
+        assert_eq!(data["validators"].as_array().unwrap().len(), 2);
+        assert_eq!(data["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn get_staking_overview_summarizes_available_read_state() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let client = LunesClient::static_validator_set(ValidatorSet {
+            lookup: "session.validators".into(),
+            validators: vec![lunes_address(8), lunes_address(9)],
+        });
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_staking_overview".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["active_validator_count"], 2);
+        assert_eq!(data["agent_policy"]["can_manage_staking"], true);
+        assert_eq!(data["write_status"], "prepare_or_local_intent_only");
     }
 
     #[tokio::test]
@@ -1601,8 +2083,23 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 22);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_network_health"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_account_overview"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_investment_position"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_validator_set"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_staking_overview"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_chain_info"));

@@ -1,5 +1,6 @@
 //! Minimal Lunes Network RPC client.
 
+use crate::address::encode_lunes_address;
 use blake2::{
     digest::{Update, VariableOutput},
     Blake2bVar,
@@ -24,6 +25,9 @@ pub struct LunesClient {
     static_info: Option<ChainInfo>,
     static_native_balance: Option<NativeBalance>,
     static_transaction_status: Option<TransactionStatus>,
+    static_account_next_index: Option<u64>,
+    static_network_health: Option<NetworkHealth>,
+    static_validator_set: Option<ValidatorSet>,
 }
 
 impl LunesClient {
@@ -37,6 +41,9 @@ impl LunesClient {
             static_info: None,
             static_native_balance: None,
             static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
         }
     }
 
@@ -48,6 +55,9 @@ impl LunesClient {
             static_info: Some(info),
             static_native_balance: None,
             static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
         }
     }
 
@@ -59,6 +69,23 @@ impl LunesClient {
             static_info: None,
             static_native_balance: Some(balance),
             static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_account_state(balance: NativeBalance, account_next_index: u64) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: Some(balance),
+            static_transaction_status: None,
+            static_account_next_index: Some(account_next_index),
+            static_network_health: None,
+            static_validator_set: None,
         }
     }
 
@@ -70,6 +97,37 @@ impl LunesClient {
             static_info: None,
             static_native_balance: None,
             static_transaction_status: Some(status),
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_network_health(health: NetworkHealth) -> Self {
+        Self {
+            endpoints: Arc::new(vec![health.endpoint.clone()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: Some(health),
+            static_validator_set: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_validator_set(validator_set: ValidatorSet) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: Some(validator_set),
         }
     }
 
@@ -101,6 +159,54 @@ impl LunesClient {
         for endpoint in self.endpoints.iter() {
             match fetch_native_balance(endpoint, &account_id).await {
                 Ok(balance) => return Ok(balance),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    pub async fn account_next_index(&self, address: &str) -> Result<u64, LunesClientError> {
+        if let Some(account_next_index) = self.static_account_next_index {
+            return Ok(account_next_index);
+        }
+
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match fetch_account_next_index(endpoint, address).await {
+                Ok(account_next_index) => return Ok(account_next_index),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    pub async fn network_health(&self) -> Result<NetworkHealth, LunesClientError> {
+        if let Some(health) = &self.static_network_health {
+            return Ok(health.clone());
+        }
+
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match fetch_network_health(endpoint).await {
+                Ok(health) => return Ok(health),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    pub async fn validator_set(&self) -> Result<ValidatorSet, LunesClientError> {
+        if let Some(validator_set) = &self.static_validator_set {
+            return Ok(validator_set.clone());
+        }
+
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match fetch_validator_set(endpoint).await {
+                Ok(validator_set) => return Ok(validator_set),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -186,6 +292,79 @@ async fn fetch_native_balance(
         rpc_request_params(&client, "state_getStorage", vec![Value::String(key)]).await?;
 
     NativeBalance::from_storage_hex(storage.as_deref())
+}
+
+async fn fetch_account_next_index(endpoint: &str, address: &str) -> Result<u64, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let value: Value = rpc_request_params(
+        &client,
+        "system_accountNextIndex",
+        vec![Value::String(address.to_string())],
+    )
+    .await?;
+
+    value_as_u64(&value).ok_or_else(|| {
+        LunesClientError::InvalidRpcResponse("system_accountNextIndex returned no nonce".into())
+    })
+}
+
+async fn fetch_network_health(endpoint: &str) -> Result<NetworkHealth, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let chain = rpc_request(&client, "system_chain").await?;
+    let node_name = rpc_request(&client, "system_name").await?;
+    let node_version = rpc_request(&client, "system_version").await?;
+    let health: Value = rpc_request(&client, "system_health").await?;
+    let best_hash: String = rpc_request(&client, "chain_getHead").await?;
+    let best_header: Value = rpc_request(&client, "chain_getHeader").await?;
+    let finalized_hash: String = rpc_request(&client, "chain_getFinalizedHead").await?;
+    let finalized_header: Value = rpc_request_params(
+        &client,
+        "chain_getHeader",
+        vec![Value::String(finalized_hash.clone())],
+    )
+    .await?;
+    let pending_extrinsics: Vec<String> = rpc_request(&client, "author_pendingExtrinsics")
+        .await
+        .unwrap_or_default();
+    let methods: Value = rpc_request(&client, "rpc_methods")
+        .await
+        .unwrap_or(Value::Null);
+
+    Ok(NetworkHealth {
+        endpoint: endpoint.to_string(),
+        chain,
+        node_name,
+        node_version,
+        peers: required_u32(&health, "peers")?,
+        is_syncing: required_bool(&health, "isSyncing")?,
+        should_have_peers: required_bool(&health, "shouldHavePeers")?,
+        best_block_hash: best_hash,
+        best_block_number: header_number(&best_header)?,
+        finalized_block_hash: finalized_hash,
+        finalized_block_number: header_number(&finalized_header)?,
+        pending_extrinsics: pending_extrinsics.len(),
+        rpc_methods: methods
+            .get("methods")
+            .and_then(|value| value.as_array())
+            .map(Vec::len)
+            .unwrap_or(0),
+    })
+}
+
+async fn fetch_validator_set(endpoint: &str) -> Result<ValidatorSet, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let key = storage_prefix_key("Session", "Validators");
+    let storage: Option<String> =
+        rpc_request_params(&client, "state_getStorage", vec![Value::String(key)]).await?;
+    let validators = decode_session_validators(storage.as_deref())?
+        .into_iter()
+        .map(encode_lunes_address)
+        .collect();
+
+    Ok(ValidatorSet {
+        lookup: "session.validators".into(),
+        validators,
+    })
 }
 
 async fn fetch_transaction_status(
@@ -383,6 +562,38 @@ impl RuntimeInfo {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NetworkHealth {
+    pub endpoint: String,
+    pub chain: String,
+    pub node_name: String,
+    pub node_version: String,
+    pub peers: u32,
+    pub is_syncing: bool,
+    pub should_have_peers: bool,
+    pub best_block_hash: String,
+    pub best_block_number: u64,
+    pub finalized_block_hash: String,
+    pub finalized_block_number: u64,
+    pub pending_extrinsics: usize,
+    pub rpc_methods: usize,
+}
+
+impl NetworkHealth {
+    pub fn finality_lag_blocks(&self) -> u64 {
+        self.best_block_number
+            .saturating_sub(self.finalized_block_number)
+    }
+
+    pub fn status(&self) -> &'static str {
+        if self.is_syncing || (self.should_have_peers && self.peers == 0) {
+            "degraded"
+        } else {
+            "healthy"
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct NativeBalance {
     pub free: u128,
@@ -424,6 +635,12 @@ impl NativeBalance {
             flags: read_u128_le(&bytes, 64)?,
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ValidatorSet {
+    pub lookup: String,
+    pub validators: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -629,6 +846,21 @@ fn required_u32(value: &Value, key: &str) -> Result<u32, LunesClientError> {
         .ok_or_else(|| LunesClientError::InvalidRpcResponse(format!("missing {key}")))
 }
 
+fn required_bool(value: &Value, key: &str) -> Result<bool, LunesClientError> {
+    value
+        .get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| LunesClientError::InvalidRpcResponse(format!("missing {key}")))
+}
+
+fn header_number(value: &Value) -> Result<u64, LunesClientError> {
+    value
+        .get("number")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| LunesClientError::InvalidRpcResponse("missing header number".into()))
+        .and_then(hex_to_u64)
+}
+
 fn value_as_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64(),
@@ -642,6 +874,184 @@ fn value_as_string(value: &Value) -> Option<String> {
         Value::String(value) => Some(value.clone()),
         Value::Array(values) => values.first().and_then(value_as_string),
         _ => None,
+    }
+}
+
+fn storage_prefix_key(pallet: &str, item: &str) -> String {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&twox128(pallet.as_bytes()));
+    key.extend_from_slice(&twox128(item.as_bytes()));
+    format!("0x{}", hex::encode(key))
+}
+
+fn twox128(input: &[u8]) -> [u8; 16] {
+    let first = xxhash64(input, 0).to_le_bytes();
+    let second = xxhash64(input, 1).to_le_bytes();
+    let mut output = [0u8; 16];
+    output[..8].copy_from_slice(&first);
+    output[8..].copy_from_slice(&second);
+    output
+}
+
+fn xxhash64(input: &[u8], seed: u64) -> u64 {
+    const PRIME64_1: u64 = 11_400_714_785_074_694_791;
+    const PRIME64_2: u64 = 14_029_467_366_897_019_727;
+    const PRIME64_3: u64 = 1_609_587_929_392_839_161;
+    const PRIME64_4: u64 = 9_650_029_242_287_828_579;
+    const PRIME64_5: u64 = 2_870_177_450_012_600_261;
+
+    let mut offset = 0;
+    let mut hash;
+
+    if input.len() >= 32 {
+        let mut v1 = seed.wrapping_add(PRIME64_1).wrapping_add(PRIME64_2);
+        let mut v2 = seed.wrapping_add(PRIME64_2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(PRIME64_1);
+
+        while offset <= input.len() - 32 {
+            v1 = xxhash64_round(v1, read_u64_le_unchecked(input, offset));
+            v2 = xxhash64_round(v2, read_u64_le_unchecked(input, offset + 8));
+            v3 = xxhash64_round(v3, read_u64_le_unchecked(input, offset + 16));
+            v4 = xxhash64_round(v4, read_u64_le_unchecked(input, offset + 24));
+            offset += 32;
+        }
+
+        hash = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+        hash = xxhash64_merge_round(hash, v1);
+        hash = xxhash64_merge_round(hash, v2);
+        hash = xxhash64_merge_round(hash, v3);
+        hash = xxhash64_merge_round(hash, v4);
+    } else {
+        hash = seed.wrapping_add(PRIME64_5);
+    }
+
+    hash = hash.wrapping_add(input.len() as u64);
+
+    while offset + 8 <= input.len() {
+        let value = xxhash64_round(0, read_u64_le_unchecked(input, offset));
+        hash ^= value;
+        hash = hash
+            .rotate_left(27)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
+        offset += 8;
+    }
+
+    if offset + 4 <= input.len() {
+        hash ^= (read_u32_le_unchecked(input, offset) as u64).wrapping_mul(PRIME64_1);
+        hash = hash
+            .rotate_left(23)
+            .wrapping_mul(PRIME64_2)
+            .wrapping_add(PRIME64_3);
+        offset += 4;
+    }
+
+    while offset < input.len() {
+        hash ^= (input[offset] as u64).wrapping_mul(PRIME64_5);
+        hash = hash.rotate_left(11).wrapping_mul(PRIME64_1);
+        offset += 1;
+    }
+
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(PRIME64_2);
+    hash ^= hash >> 29;
+    hash = hash.wrapping_mul(PRIME64_3);
+    hash ^ (hash >> 32)
+}
+
+fn xxhash64_round(accumulator: u64, input: u64) -> u64 {
+    const PRIME64_1: u64 = 11_400_714_785_074_694_791;
+    const PRIME64_2: u64 = 14_029_467_366_897_019_727;
+    accumulator
+        .wrapping_add(input.wrapping_mul(PRIME64_2))
+        .rotate_left(31)
+        .wrapping_mul(PRIME64_1)
+}
+
+fn xxhash64_merge_round(accumulator: u64, value: u64) -> u64 {
+    const PRIME64_1: u64 = 11_400_714_785_074_694_791;
+    const PRIME64_4: u64 = 9_650_029_242_287_828_579;
+    (accumulator ^ xxhash64_round(0, value))
+        .wrapping_mul(PRIME64_1)
+        .wrapping_add(PRIME64_4)
+}
+
+fn read_u64_le_unchecked(bytes: &[u8], offset: usize) -> u64 {
+    let mut output = [0u8; 8];
+    output.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(output)
+}
+
+fn read_u32_le_unchecked(bytes: &[u8], offset: usize) -> u32 {
+    let mut output = [0u8; 4];
+    output.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(output)
+}
+
+fn decode_session_validators(storage: Option<&str>) -> Result<Vec<[u8; 32]>, LunesClientError> {
+    let Some(storage) = storage else {
+        return Ok(Vec::new());
+    };
+    let bytes = hex_to_bytes(storage)?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (count, mut offset) = decode_compact_u32(&bytes)?;
+    let required_len = offset + (count as usize * 32);
+    if bytes.len() < required_len {
+        return Err(LunesClientError::InvalidRpcResponse(format!(
+            "session validators storage is too short: {} bytes",
+            bytes.len()
+        )));
+    }
+
+    let mut validators = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let mut account_id = [0u8; 32];
+        account_id.copy_from_slice(&bytes[offset..offset + 32]);
+        validators.push(account_id);
+        offset += 32;
+    }
+
+    Ok(validators)
+}
+
+fn decode_compact_u32(bytes: &[u8]) -> Result<(u32, usize), LunesClientError> {
+    let Some(first) = bytes.first() else {
+        return Err(LunesClientError::InvalidRpcResponse(
+            "missing compact length".into(),
+        ));
+    };
+
+    match first & 0b11 {
+        0 => Ok(((first >> 2) as u32, 1)),
+        1 => {
+            if bytes.len() < 2 {
+                return Err(LunesClientError::InvalidRpcResponse(
+                    "compact length is truncated".into(),
+                ));
+            }
+            let encoded = u16::from_le_bytes([bytes[0], bytes[1]]);
+            Ok(((encoded >> 2) as u32, 2))
+        }
+        2 => {
+            if bytes.len() < 4 {
+                return Err(LunesClientError::InvalidRpcResponse(
+                    "compact length is truncated".into(),
+                ));
+            }
+            let encoded = u32::from_le_bytes(bytes[..4].try_into().expect("slice length checked"));
+            Ok((encoded >> 2, 4))
+        }
+        _ => Err(LunesClientError::InvalidRpcResponse(
+            "large compact lengths are not supported".into(),
+        )),
     }
 }
 
@@ -807,6 +1217,28 @@ mod tests {
             key.starts_with("0x26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9")
         );
         assert!(key.ends_with(&hex::encode(account_id)));
+    }
+
+    #[test]
+    fn storage_prefix_key_matches_known_system_account_prefix() {
+        assert_eq!(
+            storage_prefix_key("System", "Account").trim_start_matches("0x"),
+            LUNES_ACCOUNT_STORAGE_PREFIX
+        );
+    }
+
+    #[test]
+    fn decodes_session_validators_storage() {
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let mut storage = vec![2 << 2];
+        storage.extend_from_slice(&first);
+        storage.extend_from_slice(&second);
+
+        let validators =
+            decode_session_validators(Some(&format!("0x{}", hex::encode(storage)))).unwrap();
+
+        assert_eq!(validators, vec![first, second]);
     }
 
     #[test]
