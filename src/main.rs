@@ -42,6 +42,7 @@ struct McpContext {
     rate_limit_per_second: u64,
     rate_limit_burst: u32,
     auth_required: bool,
+    transport_security: Arc<TransportSecurityState>,
 }
 
 #[derive(serde::Serialize)]
@@ -156,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limit_per_second,
         rate_limit_burst,
         auth_required,
+        transport_security: security_state.clone(),
     };
 
     let http_middleware =
@@ -248,6 +250,36 @@ async fn main() -> anyhow::Result<()> {
                 "max_request_body_bytes": MAX_REQUEST_BODY_BYTES,
                 "max_response_body_bytes": MAX_RESPONSE_BODY_BYTES,
                 "max_connections": MAX_CONNECTIONS,
+            }
+        })
+    })?;
+
+    module.register_method("mcp_metrics", |_, ctx, _| {
+        let transport = ctx.transport_security.metrics();
+        let audit_log_entries = ctx.kms.get_audit_log().len();
+
+        serde_json::json!({
+            "server": "lunes-mcp-server",
+            "version": env!("CARGO_PKG_VERSION"),
+            "transport": {
+                "accepted_requests": transport.accepted_requests,
+                "auth_rejections": transport.auth_rejections,
+                "rate_limit_rejections": transport.rate_limit_rejections,
+                "auth_required": ctx.auth_required,
+                "rate_limit": {
+                    "requests_per_second": ctx.rate_limit_per_second,
+                    "burst": ctx.rate_limit_burst,
+                },
+            },
+            "kms": {
+                "active": ctx.kms.is_active(),
+                "spent_today_lunes": ctx.kms.spent_today(),
+                "audit_log_entries": audit_log_entries,
+                "persistent_audit_log_enabled": ctx.kms.persistent_audit_log_enabled(),
+            },
+            "network": {
+                "rpc_failover_count": ctx.rpc_failover_count,
+                "archive_configured": ctx.archive_url.is_some(),
             }
         })
     })?;

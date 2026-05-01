@@ -7,7 +7,10 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -120,6 +123,21 @@ where
 pub struct TransportSecurityState {
     api_key: Option<String>,
     rate_limiter: Option<TokenBucket>,
+    metrics: TransportSecurityCounters,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+pub struct TransportSecurityMetrics {
+    pub accepted_requests: u64,
+    pub auth_rejections: u64,
+    pub rate_limit_rejections: u64,
+}
+
+#[derive(Default)]
+struct TransportSecurityCounters {
+    accepted_requests: AtomicU64,
+    auth_rejections: AtomicU64,
+    rate_limit_rejections: AtomicU64,
 }
 
 impl TransportSecurityState {
@@ -135,6 +153,7 @@ impl TransportSecurityState {
         Self {
             api_key,
             rate_limiter,
+            metrics: TransportSecurityCounters::default(),
         }
     }
 
@@ -142,19 +161,34 @@ impl TransportSecurityState {
         self.api_key.is_some()
     }
 
+    pub fn metrics(&self) -> TransportSecurityMetrics {
+        TransportSecurityMetrics {
+            accepted_requests: self.metrics.accepted_requests.load(Ordering::Relaxed),
+            auth_rejections: self.metrics.auth_rejections.load(Ordering::Relaxed),
+            rate_limit_rejections: self.metrics.rate_limit_rejections.load(Ordering::Relaxed),
+        }
+    }
+
     fn check_request(&self, headers: &http::HeaderMap) -> Result<(), SecurityRejection> {
         if let Some(expected) = &self.api_key {
             if !has_valid_api_key(headers, expected) {
+                self.metrics.auth_rejections.fetch_add(1, Ordering::Relaxed);
                 return Err(SecurityRejection::Unauthorized);
             }
         }
 
         if let Some(rate_limiter) = &self.rate_limiter {
-            rate_limiter
-                .check()
-                .map_err(SecurityRejection::RateLimited)?;
+            if let Err(retry_after) = rate_limiter.check() {
+                self.metrics
+                    .rate_limit_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(SecurityRejection::RateLimited(retry_after));
+            }
         }
 
+        self.metrics
+            .accepted_requests
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -383,6 +417,7 @@ mod tests {
             state.check_request(&headers),
             Err(SecurityRejection::Unauthorized)
         ));
+        assert_eq!(state.metrics().auth_rejections, 2);
 
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -394,6 +429,9 @@ mod tests {
             state.check_request(&headers),
             Err(SecurityRejection::RateLimited(_))
         ));
+        let metrics = state.metrics();
+        assert_eq!(metrics.accepted_requests, 1);
+        assert_eq!(metrics.rate_limit_rejections, 1);
     }
 
     #[test]

@@ -220,4 +220,6 @@ Never:
 - `lunes_read_contract` requires contract message allowlists before live reads.
 - `lunes_search_contract` exposes the local interface registry together with
   configured contract/message policy; it does not claim live ABI discovery.
+- `mcp_metrics` exposes redacted transport counters and operational KMS/network
+  metrics without returning API keys or raw audit entries.
 - All verification commands pass before publishing.

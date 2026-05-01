@@ -46,4 +46,6 @@
   until dedicated safe policies exist.
 - Added production guardrails for public binds, API keys, rate limiting,
   request limits, and graceful shutdown.
+- Added `mcp_metrics` with transport accept/reject counters, KMS audit count,
+  spend usage, and redacted network configuration.
 - Added Docker packaging and release-build CI coverage.

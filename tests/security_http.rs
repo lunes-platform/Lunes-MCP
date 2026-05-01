@@ -91,6 +91,23 @@ fn tools_list_exposes_block_history_tools() {
 }
 
 #[test]
+fn metrics_reports_transport_counters_without_secrets() {
+    let server = RunningServer::start(Some("test-token"), 10, 20);
+
+    let response = post_json_rpc(
+        &server.addr,
+        Some("Bearer test-token"),
+        r#"{"jsonrpc":"2.0","id":1,"method":"mcp_metrics","params":{}}"#,
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains(r#""accepted_requests":"#));
+    assert!(response.contains(r#""auth_rejections":"#));
+    assert!(response.contains(r#""rate_limit_rejections":"#));
+    assert!(!response.contains("test-token"));
+}
+
+#[test]
 fn rate_limit_rejects_requests_after_burst() {
     let server = RunningServer::start(Some("test-token"), 1, 1);
 

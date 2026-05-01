@@ -93,7 +93,7 @@ action passes through explicit server-side policy.
 | Transfer preparation | Build human-reviewable payloads for native LUNES and policy-limited PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
 | Policy-bounded signing | Sign local intent payloads only when autonomous mode, allowlists, TTL, and spend limits permit it |
-| Operational visibility | Report health, status, active key state, spend usage, permissions, and audit entries |
+| Operational visibility | Report health, status, transport metrics, active key state, spend usage, permissions, and audit entries |
 
 The practical result is narrow, auditable agency: an assistant can help prepare,
 explain, and route Lunes Network actions without bypassing human control or the
@@ -577,6 +577,19 @@ curl -s http://127.0.0.1:9950 \
   -H "Authorization: Bearer $LUNES_MCP_API_KEY" \
   -d '{"jsonrpc":"2.0","id":2,"method":"mcp_status","params":{}}'
 ```
+
+### Metrics
+
+```bash
+curl -s http://127.0.0.1:9950 \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $LUNES_MCP_API_KEY" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"mcp_metrics","params":{}}'
+```
+
+`mcp_metrics` reports transport accept/reject counters, rate-limit settings,
+KMS audit count, spend usage, and basic network configuration without exposing
+API keys, payload bytes, or raw audit entries.
 
 ### Public Exposure Checklist
 

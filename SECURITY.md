@@ -54,6 +54,7 @@ The `.gitignore` blocks these patterns by default.
 - Raw signed extrinsic submission still does not decode transaction contents before broadcast; it is hash-preapproved and policy-gated to prevent arbitrary relay, but only enable it in an operator-controlled environment.
 - Read-only contract simulation and contract write preparation require explicit message allowlists. PSP22 transfer signing additionally requires local asset metadata, `max_transfer_base_units`, and `allowed_recipients`; autonomous generic `contracts.call` signing is blocked.
 - Audit logs are bounded in memory by default. Set `LUNES_MCP_AUDIT_LOG_PATH` to append JSONL entries with action metadata and payload hashes for persistent retention; successful local KMS signing fails closed if that persistent write fails.
+- `mcp_metrics` exposes aggregate transport and KMS counters only; it does not return API keys, raw payload bytes, or raw audit entries.
 - Runtime config rejects public `ws://` RPC URLs and RPC URLs containing credentials, query strings, or fragments; use `wss://` for non-local endpoints.
 
 Report vulnerabilities privately to the project maintainers before public disclosure.
