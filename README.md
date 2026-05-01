@@ -1,7 +1,7 @@
 # Lunes MCP Server
 
 [![CI](https://github.com/lunes-platform/Lunes-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/lunes-platform/Lunes-MCP/actions/workflows/ci.yml)
-![Rust](https://img.shields.io/badge/Rust-1.85%2B-b7410e)
+![Rust](https://img.shields.io/badge/Rust-1.86%2B-b7410e)
 ![Transport](https://img.shields.io/badge/MCP-HTTP-2f6fed)
 ![Status](https://img.shields.io/badge/status-early%20access-f5a623)
 

@@ -2387,7 +2387,7 @@ fn transaction_hash_to_bytes(hex_value: &str) -> Result<Vec<u8>, LunesClientErro
 
 fn decode_hex_string(hex_value: &str) -> Result<Vec<u8>, String> {
     let value = hex_value.strip_prefix("0x").unwrap_or(hex_value);
-    if !value.len().is_multiple_of(2) {
+    if value.len() % 2 != 0 {
         return Err("hex string must have an even number of characters".into());
     }
     hex::decode(value).map_err(|error| error.to_string())

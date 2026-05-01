@@ -2,6 +2,7 @@
 name = "lunes-mcp-server"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.86"
 description = "Secure agent gateway for Lunes Network tooling"
 publish = false
 
