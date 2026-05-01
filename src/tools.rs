@@ -165,6 +165,12 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_prepare_governance_remove_vote" => {
             handle_prepare_governance_remove_vote(&request.arguments, kms)
         }
+        "lunes_prepare_governance_delegate" => {
+            handle_prepare_governance_delegate(&request.arguments, kms)
+        }
+        "lunes_prepare_governance_undelegate" => {
+            handle_prepare_governance_undelegate(&request.arguments, kms)
+        }
 
         // Agent wallet lifecycle
         "lunes_provision_agent_wallet" => handle_provision_wallet(kms),
@@ -711,6 +717,34 @@ pub fn tool_definitions() -> Vec<Value> {
                     "confirm_broadcast": { "type": "boolean", "description": "Rejected when true; governance tools never broadcast." }
                 },
                 "required": ["referendum_index"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_prepare_governance_delegate",
+            "description": "Prepare a human-review governance delegation payload without signing or broadcasting.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "track": { "type": "integer", "minimum": 0, "description": "Governance track/class allowed by delegation policy." },
+                    "delegate": { "type": "string", "description": "Delegate SS58 address allowed by governance policy." },
+                    "conviction": { "type": "string", "description": "Conviction lock, for example none, locked1x, locked2x, locked3x, locked4x, locked5x, locked6x." },
+                    "amount": { "type": "integer", "minimum": 1, "description": "Whole LUNES lock amount." },
+                    "amount_base_units": { "type": "string", "description": "Exact base-unit lock amount. Must match amount when both are provided." },
+                    "confirm_broadcast": { "type": "boolean", "description": "Rejected when true; governance tools never broadcast." }
+                },
+                "required": ["track", "delegate", "conviction"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_prepare_governance_undelegate",
+            "description": "Prepare a human-review governance undelegation payload without signing or broadcasting.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "track": { "type": "integer", "minimum": 0, "description": "Governance track/class allowed by delegation policy." },
+                    "confirm_broadcast": { "type": "boolean", "description": "Rejected when true; governance tools never broadcast." }
+                },
+                "required": ["track"]
             }
         }),
         serde_json::json!({
@@ -1877,12 +1911,25 @@ fn can_manage_staking(kms: &AgentKms) -> bool {
 }
 
 fn can_prepare_governance_actions(kms: &AgentKms) -> bool {
+    can_prepare_governance_votes(kms) || can_prepare_governance_delegations(kms)
+}
+
+fn can_prepare_governance_votes(kms: &AgentKms) -> bool {
     let policy = &kms.permissions().governance;
     policy.allow_prepare_votes
         && !policy.allowed_referenda.is_empty()
         && !policy.allowed_vote_directions.is_empty()
         && !policy.allowed_convictions.is_empty()
         && policy.max_vote_lunes > 0
+}
+
+fn can_prepare_governance_delegations(kms: &AgentKms) -> bool {
+    let policy = &kms.permissions().governance;
+    policy.allow_prepare_delegations
+        && !policy.allowed_delegation_tracks.is_empty()
+        && !policy.allowed_delegates.is_empty()
+        && !policy.allowed_convictions.is_empty()
+        && policy.max_delegation_lunes > 0
 }
 
 fn staking_tools_allowed(kms: &AgentKms) -> Vec<String> {
@@ -1925,10 +1972,16 @@ fn governance_policy_json(kms: &AgentKms) -> Value {
     let policy = &kms.permissions().governance;
     serde_json::json!({
         "allow_prepare_votes": policy.allow_prepare_votes,
+        "allow_prepare_delegations": policy.allow_prepare_delegations,
         "allowed_referenda": policy.allowed_referenda,
+        "allowed_delegation_tracks": policy.allowed_delegation_tracks,
+        "allowed_delegates": policy.allowed_delegates,
         "allowed_vote_directions": policy.allowed_vote_directions,
         "allowed_convictions": policy.allowed_convictions,
         "max_vote_lunes": policy.max_vote_lunes,
+        "max_delegation_lunes": policy.max_delegation_lunes,
+        "can_prepare_governance_votes": can_prepare_governance_votes(kms),
+        "can_prepare_governance_delegations": can_prepare_governance_delegations(kms),
         "can_prepare_governance_actions": can_prepare_governance_actions(kms),
         "final_vote_signing": "external_wallet_only",
         "mcp_broadcast": false,
@@ -2965,6 +3018,88 @@ fn handle_prepare_governance_remove_vote(args: &Value, kms: &AgentKms) -> McpToo
     )
 }
 
+fn handle_prepare_governance_delegate(args: &Value, kms: &AgentKms) -> McpToolResult {
+    if let Some(error) = reject_governance_broadcast(args) {
+        return error;
+    }
+
+    let track = match governance_track_arg(args) {
+        Ok(track) => track,
+        Err(error) => return error,
+    };
+    let delegate = args
+        .get("delegate")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if let Err(error) = parse_lunes_address(delegate, "delegate") {
+        return error;
+    }
+    let conviction = match governance_conviction_arg(args) {
+        Ok(conviction) => conviction,
+        Err(error) => return error,
+    };
+    let amount = match native_transfer_amount_from_args(args) {
+        Ok(amount) => amount,
+        Err(error) => return error,
+    };
+
+    if let Some(error) =
+        validate_governance_delegation_policy(kms, track, delegate, conviction, amount.amount_lunes)
+    {
+        return error;
+    }
+
+    governance_pending_result(
+        kms,
+        serde_json::json!({
+            "action": "conviction_voting.delegate",
+            "track": track,
+            "delegate": delegate,
+            "delegation": {
+                "conviction": conviction,
+                "amount_lunes": amount.amount_lunes,
+                "amount_exact_lunes": amount.exact_lunes,
+                "amount_base_units": amount.amount_base_units.to_string(),
+            },
+            "unsigned_payload": format!(
+                "conviction_voting.delegate({track},{delegate},{conviction},{})",
+                amount.amount_base_units
+            ),
+            "broadcasted": false,
+            "submission_status": "not_broadcasted",
+            "signing_status": "not_signed_by_mcp",
+            "next_step": "Human must review and sign this governance delegation with an external wallet.",
+        }),
+    )
+}
+
+fn handle_prepare_governance_undelegate(args: &Value, kms: &AgentKms) -> McpToolResult {
+    if let Some(error) = reject_governance_broadcast(args) {
+        return error;
+    }
+
+    let track = match governance_track_arg(args) {
+        Ok(track) => track,
+        Err(error) => return error,
+    };
+    if let Some(error) = validate_governance_delegation_track_policy(kms, track) {
+        return error;
+    }
+
+    governance_pending_result(
+        kms,
+        serde_json::json!({
+            "action": "conviction_voting.undelegate",
+            "track": track,
+            "unsigned_payload": format!("conviction_voting.undelegate({track})"),
+            "broadcasted": false,
+            "submission_status": "not_broadcasted",
+            "signing_status": "not_signed_by_mcp",
+            "next_step": "Human must review and sign this governance undelegation with an external wallet.",
+        }),
+    )
+}
+
 fn governance_pending_result(kms: &AgentKms, mut data: Value) -> McpToolResult {
     if kms.permissions().human_approval_required {
         if let Some(template) = &kms.permissions().approval_message_template {
@@ -3009,6 +3144,18 @@ fn governance_referendum_index_arg(args: &Value) -> Result<u32, McpToolResult> {
             "referendum_index exceeds the supported range".into(),
         )
     })
+}
+
+fn governance_track_arg(args: &Value) -> Result<u16, McpToolResult> {
+    let Some(track) = args.get("track").and_then(|value| value.as_u64()) else {
+        return Err(McpToolResult::error(
+            -32001,
+            "Missing required field: track".into(),
+        ));
+    };
+
+    u16::try_from(track)
+        .map_err(|_| McpToolResult::error(-32001, "track exceeds the supported range".into()))
 }
 
 fn governance_vote_arg(args: &Value) -> Result<&'static str, McpToolResult> {
@@ -3087,6 +3234,75 @@ fn validate_governance_vote_policy(
         return Some(McpToolResult::error(
             -32011,
             format!("Governance conviction '{conviction}' is not allowed by policy"),
+        ));
+    }
+
+    None
+}
+
+fn validate_governance_delegation_policy(
+    kms: &AgentKms,
+    track: u16,
+    delegate: &str,
+    conviction: &str,
+    amount_lunes: u64,
+) -> Option<McpToolResult> {
+    if let Some(error) = validate_governance_delegation_track_policy(kms, track) {
+        return Some(error);
+    }
+    let policy = &kms.permissions().governance;
+
+    if !policy
+        .allowed_delegates
+        .iter()
+        .any(|allowed| allowed == delegate)
+    {
+        return Some(McpToolResult::error(
+            -32011,
+            format!("Governance delegate '{delegate}' is not allowed by policy"),
+        ));
+    }
+
+    if !policy
+        .allowed_convictions
+        .iter()
+        .any(|allowed| allowed == conviction)
+    {
+        return Some(McpToolResult::error(
+            -32011,
+            format!("Governance conviction '{conviction}' is not allowed by policy"),
+        ));
+    }
+
+    if policy.max_delegation_lunes == 0 || amount_lunes > policy.max_delegation_lunes {
+        return Some(McpToolResult::error(
+            -32011,
+            format!(
+                "Governance delegation amount {amount_lunes} LUNES exceeds configured max_delegation_lunes {}",
+                policy.max_delegation_lunes
+            ),
+        ));
+    }
+
+    None
+}
+
+fn validate_governance_delegation_track_policy(
+    kms: &AgentKms,
+    track: u16,
+) -> Option<McpToolResult> {
+    let policy = &kms.permissions().governance;
+    if !policy.allow_prepare_delegations {
+        return Some(McpToolResult::error(
+            -32011,
+            "Governance delegation preparation is disabled by policy".into(),
+        ));
+    }
+
+    if !policy.allowed_delegation_tracks.contains(&track) {
+        return Some(McpToolResult::error(
+            -32011,
+            format!("Governance track {track} is not allowed by delegation policy"),
         ));
     }
 
@@ -3402,10 +3618,14 @@ mod tests {
         PermissionsConfig {
             governance: GovernancePolicyConfig {
                 allow_prepare_votes: true,
+                allow_prepare_delegations: true,
                 allowed_referenda: vec![12],
+                allowed_delegation_tracks: vec![0],
+                allowed_delegates: vec![lunes_address(6)],
                 allowed_vote_directions: vec!["aye".into()],
                 allowed_convictions: vec!["locked1x".into()],
                 max_vote_lunes: 50,
+                max_delegation_lunes: 25,
             },
             ..permissions()
         }
@@ -4931,6 +5151,126 @@ mod tests {
     }
 
     #[test]
+    fn prepare_governance_delegate_returns_pending_without_signature() {
+        let delegate = lunes_address(6);
+        let kms = AgentKms::new(AgentMode::Autonomous, governance_permissions());
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_delegate".into(),
+                arguments: serde_json::json!({
+                    "track": 0,
+                    "delegate": delegate,
+                    "conviction": "locked1x",
+                    "amount": 10,
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["status"], "pending_human_approval");
+        assert_eq!(data["data"]["action"], "conviction_voting.delegate");
+        assert_eq!(data["data"]["track"], 0);
+        assert_eq!(data["data"]["broadcasted"], false);
+        assert_eq!(data["data"]["signing_status"], "not_signed_by_mcp");
+        assert!(data["data"].get("signature").is_none());
+    }
+
+    #[test]
+    fn prepare_governance_delegate_enforces_delegate_policy() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, governance_permissions());
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_delegate".into(),
+                arguments: serde_json::json!({
+                    "track": 0,
+                    "delegate": lunes_address(99),
+                    "conviction": "locked1x",
+                    "amount": 10,
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("not allowed"));
+    }
+
+    #[test]
+    fn prepare_governance_delegate_rejects_broadcast_and_amount_over_policy() {
+        let delegate = lunes_address(6);
+        let kms = AgentKms::new(AgentMode::Autonomous, governance_permissions());
+
+        let broadcast_attempt = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_delegate".into(),
+                arguments: serde_json::json!({
+                    "track": 0,
+                    "delegate": delegate,
+                    "conviction": "locked1x",
+                    "amount": 10,
+                    "confirm_broadcast": true,
+                }),
+            },
+            &kms,
+        );
+        assert!(broadcast_attempt.is_error);
+        assert!(broadcast_attempt.content[0].text.contains("prepare-only"));
+
+        let over_limit = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_delegate".into(),
+                arguments: serde_json::json!({
+                    "track": 0,
+                    "delegate": lunes_address(6),
+                    "conviction": "locked1x",
+                    "amount": 26,
+                }),
+            },
+            &kms,
+        );
+        assert!(over_limit.is_error);
+        assert!(over_limit.content[0].text.contains("max_delegation_lunes"));
+    }
+
+    #[test]
+    fn prepare_governance_undelegate_is_pending_and_track_bound() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, governance_permissions());
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_undelegate".into(),
+                arguments: serde_json::json!({
+                    "track": 0,
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["status"], "pending_human_approval");
+        assert_eq!(data["data"]["action"], "conviction_voting.undelegate");
+        assert_eq!(data["data"]["broadcasted"], false);
+
+        let denied = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_undelegate".into(),
+                arguments: serde_json::json!({
+                    "track": 99,
+                }),
+            },
+            &kms,
+        );
+
+        assert!(denied.is_error);
+        assert!(denied.content[0].text.contains("track"));
+    }
+
+    #[test]
     fn psp22_transfer_requires_asset_specific_limit() {
         let contract = lunes_address(2);
         let to = lunes_address(3);
@@ -5278,7 +5618,7 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 38);
+        assert_eq!(tools.len(), 40);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_assets"));
         assert!(tools
@@ -5358,6 +5698,12 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_prepare_governance_remove_vote"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_prepare_governance_delegate"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_prepare_governance_undelegate"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_transfer_native"));

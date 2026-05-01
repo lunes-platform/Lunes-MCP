@@ -48,7 +48,7 @@ The `.gitignore` blocks these patterns by default.
 - PSP22 decoded balance values, automatic token metadata discovery, governance metadata decoding, account voting history, decoded validator exposure, reward payout history, indexed full-history transaction search, and KMS-built staking/generic-contract/governance transaction signing still need full network-backed implementations.
 - Recent block summaries intentionally omit raw extrinsics; account activity timelines use raw account-id substring matching and can miss encoded relationships that require a full indexer or metadata-aware decoding.
 - Staking write tools prepare or locally sign intent payloads only; validator, payout, and reward-account choices must be explicitly whitelisted.
-- Governance preparation requires a dedicated referendum/direction/conviction/amount policy and never signs locally, even when autonomous mode is active.
+- Governance preparation requires dedicated vote or delegation policy and never signs locally, even when autonomous mode is active.
 - SS58 validation checks the Lunes Network prefix and checksum, but it does not prove account ownership.
 - Autonomous signatures are local intent payload signatures except for guarded native LUNES transfer broadcast, which builds and signs a final network transaction only after all internal signing guardrails pass.
 - Raw signed extrinsic submission still does not decode transaction contents before broadcast; it is hash-preapproved and policy-gated to prevent arbitrary relay, but only enable it in an operator-controlled environment.

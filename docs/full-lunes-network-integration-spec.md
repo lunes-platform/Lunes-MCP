@@ -6,8 +6,9 @@ Implement the MCP server as a guarded Lunes Network gateway that can read live s
 The first implementation slice is native LUNES transfer finalization through `lunes_transfer_native`. Existing prepare-only and local-intent signing behavior must remain available when live broadcast guardrails are not satisfied.
 
 The next safe slice is governance visibility and preparation: read bounded raw
-referendum storage, expose the explicit governance policy, and prepare vote
-payloads for human review without local signing or broadcast.
+referendum storage, expose the explicit governance policy, and prepare vote,
+remove-vote, delegation, and undelegation payloads for human review without
+local signing or broadcast.
 
 The current staking slice adds policy-bound rebond and payout preparation plus
 partial validator scoring from observable profile data. It does not decode
@@ -69,9 +70,11 @@ Use typed structs for internal chain results. Keep `serde_json::Value` only at M
 - `lunes_get_governance_overview` and `lunes_get_referenda` expose bounded raw
   governance storage reads.
 - `lunes_prepare_governance_vote` and
-  `lunes_prepare_governance_remove_vote` require dedicated governance policy,
-  reject `confirm_broadcast=true`, return `pending_human_approval`, and never
-  call KMS signing.
+  `lunes_prepare_governance_remove_vote` require dedicated governance policy.
+  `lunes_prepare_governance_delegate` and
+  `lunes_prepare_governance_undelegate` require dedicated delegation track and
+  delegate policy. All governance prepare tools reject `confirm_broadcast=true`,
+  return `pending_human_approval`, and never call KMS signing.
 - `lunes_stake_rebond` and `lunes_stake_payout` prepare or locally sign intent
   payloads only; payout requires a whitelisted validator stash.
 - `lunes_get_validator_scores` returns bounded partial scores using active-set

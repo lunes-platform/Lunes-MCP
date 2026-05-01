@@ -125,9 +125,21 @@ pub struct GovernancePolicyConfig {
     #[serde(default)]
     pub allow_prepare_votes: bool,
 
+    /// Allows MCP tools to prepare human-review delegation payloads.
+    #[serde(default)]
+    pub allow_prepare_delegations: bool,
+
     /// Referendum indexes the agent may prepare payloads for.
     #[serde(default)]
     pub allowed_referenda: Vec<u32>,
+
+    /// Governance tracks/classes the agent may prepare delegation payloads for.
+    #[serde(default)]
+    pub allowed_delegation_tracks: Vec<u16>,
+
+    /// Delegates the agent may prepare delegation payloads for.
+    #[serde(default)]
+    pub allowed_delegates: Vec<String>,
 
     /// Allowed vote directions, for example `aye` and/or `nay`.
     #[serde(default)]
@@ -140,6 +152,10 @@ pub struct GovernancePolicyConfig {
     /// Maximum LUNES lock amount for a prepared vote. Zero denies vote payloads.
     #[serde(default)]
     pub max_vote_lunes: u64,
+
+    /// Maximum LUNES lock amount for a prepared delegation. Zero denies delegation payloads.
+    #[serde(default)]
+    pub max_delegation_lunes: u64,
 }
 
 fn default_ttl_hours() -> u64 {
@@ -565,6 +581,42 @@ allowed_recipients = ["5RecipientAddress"]
         assert_eq!(policy.decimals, Some(12));
         assert_eq!(policy.max_transfer_base_units.as_deref(), Some("1000"));
         assert_eq!(policy.allowed_recipients, vec!["5RecipientAddress"]);
+    }
+
+    #[test]
+    fn test_parse_governance_delegation_policy_config() {
+        let toml_str = r#"
+[network]
+rpc_url = "wss://ws.lunes.io"
+
+[agent.wallet]
+mode = "prepare_only"
+
+[agent.permissions]
+allowed_extrinsics = []
+daily_limit_lunes = 0
+
+[agent.permissions.governance]
+allow_prepare_votes = true
+allow_prepare_delegations = true
+allowed_referenda = [12]
+allowed_delegation_tracks = [0, 1]
+allowed_delegates = ["5DelegateAddress"]
+allowed_vote_directions = ["aye"]
+allowed_convictions = ["locked1x"]
+max_vote_lunes = 50
+max_delegation_lunes = 25
+"#;
+        let file: ConfigFile = toml::from_str(toml_str).unwrap();
+        let policy = file.agent.permissions.governance;
+
+        assert!(policy.allow_prepare_votes);
+        assert!(policy.allow_prepare_delegations);
+        assert_eq!(policy.allowed_referenda, vec![12]);
+        assert_eq!(policy.allowed_delegation_tracks, vec![0, 1]);
+        assert_eq!(policy.allowed_delegates, vec!["5DelegateAddress"]);
+        assert_eq!(policy.max_vote_lunes, 50);
+        assert_eq!(policy.max_delegation_lunes, 25);
     }
 
     #[test]

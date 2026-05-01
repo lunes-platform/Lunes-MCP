@@ -88,7 +88,7 @@ action passes through explicit server-side policy.
 | Investment planning | Summarize liquid and reserved/locked LUNES for conservative staking or treasury planning |
 | Staking management | Prepare bond, unbond, withdraw, nominate, chill, and reward-destination updates |
 | Governance visibility | Read bounded raw referendum storage and current prepare-only governance policy |
-| Governance preparation | Prepare human-review vote and remove-vote payloads without MCP signing or broadcast |
+| Governance preparation | Prepare human-review vote, remove-vote, delegation, and undelegation payloads without MCP signing or broadcast |
 | Contract discovery | Look up Lunes contract interface metadata, message allowlists, and local asset policy through the tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and policy-limited PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
@@ -188,10 +188,14 @@ ttl_hours = 168
 
 [agent.permissions.governance]
 allow_prepare_votes = false
+allow_prepare_delegations = false
 allowed_referenda = []
+allowed_delegation_tracks = []
+allowed_delegates = []
 allowed_vote_directions = []
 allowed_convictions = []
 max_vote_lunes = 0
+max_delegation_lunes = 0
 
 [server]
 bind_address = "127.0.0.1"
@@ -248,16 +252,20 @@ allowed_recipients = ["5recipient..."]
 ```
 
 For governance workflows, use the dedicated prepare-only policy. This policy
-does not authorize final votes; it only lets the MCP server build an explicit
-payload for human review in an external wallet:
+does not authorize final votes or delegations; it only lets the MCP server
+build explicit payloads for human review in an external wallet:
 
 ```toml
 [agent.permissions.governance]
 allow_prepare_votes = true
+allow_prepare_delegations = true
 allowed_referenda = [12]
+allowed_delegation_tracks = [0]
+allowed_delegates = ["6delegate..."]
 allowed_vote_directions = ["aye"]
 allowed_convictions = ["locked1x"]
 max_vote_lunes = 50
+max_delegation_lunes = 25
 ```
 
 For a protected remote or container deployment:
@@ -529,6 +537,8 @@ use a client with HTTP MCP transport support.
 | `lunes_stake_set_payee` | Write | Prepares or signs staking reward destination updates |
 | `lunes_prepare_governance_vote` | Prepare | Builds a human-review governance vote payload without signing or broadcasting |
 | `lunes_prepare_governance_remove_vote` | Prepare | Builds a human-review remove-vote payload without signing or broadcasting |
+| `lunes_prepare_governance_delegate` | Prepare | Builds a human-review governance delegation payload without signing or broadcasting |
+| `lunes_prepare_governance_undelegate` | Prepare | Builds a human-review governance undelegation payload without signing or broadcasting |
 | `lunes_provision_agent_wallet` | Lifecycle | Creates a local agent key for approval |
 | `lunes_revoke_agent_wallet` | Lifecycle | Revokes the current local agent key |
 
@@ -539,8 +549,10 @@ signing guardrails above. `lunes_submit_signed_extrinsic` remains the relay path
 for payloads that were already signed outside this server. Contract write tools
 require explicit contract/message allowlists; an empty method list does not
 grant wildcard contract access. Governance prepare tools are stricter: they
-never sign in autonomous mode, reject `confirm_broadcast=true`, and require the
-dedicated governance policy fields before returning a pending approval payload.
+never sign in autonomous mode, reject `confirm_broadcast=true`, and require
+dedicated policy fields before returning a pending approval payload. Vote
+preparation is bounded by referendum, direction, conviction, and amount;
+delegation preparation is bounded by track, delegate, conviction, and amount.
 
 ## Specifications
 

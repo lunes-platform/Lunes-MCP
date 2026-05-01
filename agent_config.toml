@@ -65,12 +65,16 @@ ttl_hours = 168
 
 [agent.permissions.governance]
 # Governance is prepare-only. These fields only allow human-review payloads;
-# final votes must be signed in an external wallet.
+# final votes and delegations must be signed in an external wallet.
 allow_prepare_votes = false
+allow_prepare_delegations = false
 allowed_referenda = []
+allowed_delegation_tracks = []
+allowed_delegates = []
 allowed_vote_directions = []
 allowed_convictions = []
 max_vote_lunes = 0
+max_delegation_lunes = 0
 
 [server]
 # Keep localhost by default. For containers, use 0.0.0.0 only with

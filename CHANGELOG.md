@@ -39,6 +39,8 @@
 - Added governance read/preparation tools for bounded raw referendum storage,
   explicit prepare-only vote policy, and human-review vote/remove-vote payloads
   that never sign or broadcast.
+- Added governance delegation and undelegation preparation with dedicated
+  track, delegate, conviction, and amount policy checks.
 - Blocked autonomous high-risk governance and indirection extrinsics such as
   referendum voting, batching, proxy, multisig, scheduler, and preimage calls
   until dedicated safe policies exist.

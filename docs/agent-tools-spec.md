@@ -75,6 +75,8 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_stake_payout` | Write | Prepare or locally sign `staking.payout_stakers` for a whitelisted validator stash and era |
 | `lunes_prepare_governance_vote` | Prepare | Prepare a human-review governance vote payload without signing or broadcasting |
 | `lunes_prepare_governance_remove_vote` | Prepare | Prepare a human-review remove-vote payload without signing or broadcasting |
+| `lunes_prepare_governance_delegate` | Prepare | Prepare a human-review governance delegation payload without signing or broadcasting |
+| `lunes_prepare_governance_undelegate` | Prepare | Prepare a human-review governance undelegation payload without signing or broadcasting |
 | `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
 | `lunes_search_contract` | Read | Look up local interface metadata, configured message allowlists, and PSP22 asset policy |
 
@@ -192,9 +194,10 @@ Never:
   the prepare-only governance policy explicit.
 - `lunes_get_referenda` returns bounded raw referendum storage without
   pretending to decode referendum metadata.
-- `lunes_prepare_governance_vote` and
-  `lunes_prepare_governance_remove_vote` return pending human approval payloads
-  with `broadcasted=false`, no transaction hash, and no local KMS signature.
+- Governance prepare tools return pending human approval payloads with
+  `broadcasted=false`, no transaction hash, and no local KMS signature. Votes
+  are bounded by referendum/direction/conviction/amount policy; delegation and
+  undelegation are bounded by track/delegate/conviction/amount policy.
 - `lunes_get_recent_blocks` returns only block hash, number, and extrinsic count
   for bounded recent finalized block windows.
 - `lunes_get_block_events` returns raw event storage for an explicitly selected
