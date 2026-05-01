@@ -1,8 +1,4 @@
-//! Lunes MCP Server - entry point.
-//!
 //! JSON-RPC server exposing MCP tools for Lunes Network workflows.
-//! It loads the agent configuration, initializes the KMS, registers RPC
-//! methods, and applies policy and transport guardrails before handling calls.
 
 mod abi_registry;
 mod address;
@@ -14,6 +10,8 @@ mod tools;
 
 use anyhow::Context;
 use jsonrpsee::server::{RpcModule, ServerBuilder};
+use jsonrpsee::types::Params;
+use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -21,8 +19,8 @@ use tracing::{error, info, warn};
 use crate::config::{
     default_safe_config, load_config, validate_runtime_config, AgentMode, AUTONOMOUS_STUB_ENV_VAR,
 };
-use crate::kms::AgentKms;
-use crate::lunes_client::LunesClient;
+use crate::kms::{AgentKms, AuditAction};
+use crate::lunes_client::{redact_rpc_endpoint, LunesClient};
 use crate::security::{
     validate_public_exposure, RateLimitSettings, TransportSecurityLayer, TransportSecurityState,
     API_KEY_ENV_VAR,
@@ -32,8 +30,6 @@ use crate::tools::{dispatch_tool_call_with_chain, tool_definitions, ToolCallRequ
 const MAX_REQUEST_BODY_BYTES: u32 = 64 * 1024;
 const MAX_RESPONSE_BODY_BYTES: u32 = 256 * 1024;
 const MAX_CONNECTIONS: u32 = 64;
-
-// --- Shared context ------------------------------------------------------
 
 struct McpContext {
     kms: AgentKms,
@@ -47,12 +43,20 @@ struct McpContext {
     auth_required: bool,
 }
 
-// --- Main ----------------------------------------------------------------
+#[derive(serde::Serialize)]
+struct AuditLogEntry {
+    timestamp: String,
+    action: AuditAction,
+    extrinsic: String,
+    destination: Option<String>,
+    amount_lunes: u64,
+    payload_hash: Option<String>,
+    success: bool,
+    error: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with optional RUST_LOG filters.
-    // Use JSON formatting if in production.
     let is_prod = std::env::var("ENVIRONMENT").unwrap_or_default() == "production";
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -70,19 +74,8 @@ async fn main() -> anyhow::Result<()> {
     info!("Secure agent gateway for Lunes Network tooling");
     info!(version = env!("CARGO_PKG_VERSION"), "Starting server");
 
-    // 1. Load configuration.
     let config_file = match load_config("agent_config.toml") {
-        Ok(cfg) => {
-            info!(
-                rpc_url = %cfg.network.rpc_url,
-                mode = ?cfg.agent.wallet.mode,
-                daily_limit = cfg.agent.permissions.daily_limit_lunes,
-                ttl_hours = cfg.agent.permissions.ttl_hours,
-                allowed_extrinsics = ?cfg.agent.permissions.allowed_extrinsics,
-                "Config loaded successfully"
-            );
-            cfg
-        }
+        Ok(cfg) => cfg,
         Err(e) => {
             warn!(
                 "Failed to load agent_config.toml: {}. Using safe defaults (prepare_only, mainnet).",
@@ -96,10 +89,22 @@ async fn main() -> anyhow::Result<()> {
     let rpc_url = config_file.network.rpc_url.clone();
     let rpc_failover_count = config_file.network.rpc_failovers.len();
     let archive_url = config_file.network.archive_url.clone();
+    let display_rpc_url = redact_rpc_endpoint(&rpc_url);
+    let display_archive_url = archive_url
+        .as_ref()
+        .map(|endpoint| redact_rpc_endpoint(endpoint));
     let autonomous_stub_allowed = std::env::var(AUTONOMOUS_STUB_ENV_VAR)
         .map(|value| value == "1")
         .unwrap_or(false);
     validate_runtime_config(&config_file, autonomous_stub_allowed)?;
+    info!(
+        rpc_url = %display_rpc_url,
+        mode = ?config_file.agent.wallet.mode,
+        daily_limit = config_file.agent.permissions.daily_limit_lunes,
+        ttl_hours = config_file.agent.permissions.ttl_hours,
+        allowed_extrinsics = ?config_file.agent.permissions.allowed_extrinsics,
+        "Config loaded successfully"
+    );
 
     let (configured_bind_addr, rate_limit_per_second, rate_limit_burst) =
         if let Some(server) = config_file.server.as_ref() {
@@ -112,7 +117,6 @@ async fn main() -> anyhow::Result<()> {
             ("127.0.0.1:9950".to_string(), 10, 20)
         };
 
-    // Bind address: env var -> config -> default
     let bind_addr = std::env::var("LUNES_MCP_BIND").unwrap_or(configured_bind_addr);
 
     let addr: SocketAddr = bind_addr
@@ -132,26 +136,24 @@ async fn main() -> anyhow::Result<()> {
     validate_public_exposure(&addr, auth_required, rate_limit)
         .with_context(|| format!("Refusing unsafe public bind on {addr}"))?;
 
-    // 2. Initialize the KMS.
     let lunes_client = LunesClient::new(
         rpc_url.clone(),
         config_file.network.rpc_failovers.clone(),
         archive_url.clone(),
     );
     let kms = AgentKms::new(config_file.agent.wallet.mode, config_file.agent.permissions);
-    let ctx = Arc::new(McpContext {
+    let ctx = McpContext {
         kms,
         lunes_client,
         config_mode: mode.clone(),
-        rpc_url: rpc_url.clone(),
+        rpc_url: display_rpc_url.clone(),
         rpc_failover_count,
-        archive_url,
+        archive_url: display_archive_url,
         rate_limit_per_second,
         rate_limit_burst,
         auth_required,
-    });
+    };
 
-    // 3. Configure the JSON-RPC server.
     let http_middleware =
         tower::ServiceBuilder::new().layer(TransportSecurityLayer::new(security_state));
     let server = ServerBuilder::default()
@@ -164,7 +166,6 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let mut module = RpcModule::new(ctx);
 
-    // Endpoint: initialize (MCP lifecycle)
     module.register_method("initialize", |_, _, _| {
         serde_json::json!({
             "protocolVersion": "2025-11-25",
@@ -180,11 +181,9 @@ async fn main() -> anyhow::Result<()> {
         })
     })?;
 
-    // Endpoint: notifications/initialized (MCP lifecycle)
     // MCP clients send this notification after `initialize`; no state is needed here.
     module.register_method("notifications/initialized", |_, _, _| serde_json::json!({}))?;
 
-    // Endpoint: tools/list
     module.register_method("tools/list", |_, _, _| {
         serde_json::json!({
             "tools": tool_definitions(),
@@ -192,43 +191,26 @@ async fn main() -> anyhow::Result<()> {
         })
     })?;
 
-    // Endpoint: tools/call
     module.register_async_method("tools/call", |params, ctx, _| async move {
-        let request: ToolCallRequest = match params.parse() {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Invalid tool call request: {}", e);
-                return serde_json::json!({
-                    "content": [{ "type": "text", "text": format!("Invalid request: {}", e) }],
-                    "isError": true
-                });
-            }
-        };
-
-        info!(tool = %request.name, "Processing tool call");
-        let response = dispatch_tool_call_with_chain(&request, &ctx.kms, &ctx.lunes_client).await;
-        serde_json::to_value(&response).unwrap_or_default()
+        handle_tool_rpc(
+            params,
+            ctx,
+            "Processing tool call",
+            "Invalid tool call request",
+        )
+        .await
     })?;
 
-    // Endpoint: mcp_execute_agent_tx
     module.register_async_method("mcp_execute_agent_tx", |params, ctx, _| async move {
-        let request: ToolCallRequest = match params.parse() {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Invalid execute request: {}", e);
-                return serde_json::json!({
-                    "content": [{ "type": "text", "text": format!("Invalid request: {}", e) }],
-                    "isError": true
-                });
-            }
-        };
-
-        info!(tool = %request.name, "Executing autonomous agent transaction");
-        let response = dispatch_tool_call_with_chain(&request, &ctx.kms, &ctx.lunes_client).await;
-        serde_json::to_value(&response).unwrap_or_default()
+        handle_tool_rpc(
+            params,
+            ctx,
+            "Executing autonomous agent transaction",
+            "Invalid execute request",
+        )
+        .await
     })?;
 
-    // Endpoint: mcp_health
     module.register_method("mcp_health", |_, ctx, _| {
         serde_json::json!({
             "status": "ok",
@@ -239,7 +221,6 @@ async fn main() -> anyhow::Result<()> {
         })
     })?;
 
-    // Endpoint: mcp_status
     module.register_method("mcp_status", |_, ctx, _| {
         serde_json::json!({
             "server": "lunes-mcp-server",
@@ -267,28 +248,26 @@ async fn main() -> anyhow::Result<()> {
         })
     })?;
 
-    // Endpoint: mcp_audit_log
     module.register_method("mcp_audit_log", |_, ctx, _| {
         let log = ctx.kms.get_audit_log();
-        let entries: Vec<serde_json::Value> = log
+        let entries: Vec<AuditLogEntry> = log
             .iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "timestamp": entry.timestamp.to_rfc3339(),
-                    "action": entry.action,
-                    "extrinsic": entry.extrinsic,
-                    "amount_lunes": entry.amount_lunes,
-                    "success": entry.success,
-                    "error": entry.error,
-                })
+            .map(|entry| AuditLogEntry {
+                timestamp: entry.timestamp.to_rfc3339(),
+                action: entry.action,
+                extrinsic: entry.extrinsic.clone(),
+                destination: entry.destination.clone(),
+                amount_lunes: entry.amount_lunes,
+                payload_hash: entry.payload_hash.clone(),
+                success: entry.success,
+                error: entry.error.clone(),
             })
             .collect();
         serde_json::json!({ "audit_log": entries })
     })?;
 
-    // 4. Start the server.
     info!("Lunes MCP Server listening on http://{}", addr);
-    info!("Connected to Lunes network: {}", rpc_url);
+    info!("Connected to Lunes network: {}", display_rpc_url);
     info!(
         requests_per_second = rate_limit_per_second,
         burst = rate_limit_burst,
@@ -314,7 +293,6 @@ async fn main() -> anyhow::Result<()> {
     let handle = server.start(module);
     let stopped_handle = handle.clone();
 
-    // 5. Graceful shutdown.
     tokio::select! {
         _ = stopped_handle.stopped() => {
             info!("Server stopped.");
@@ -328,6 +306,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn handle_tool_rpc(
+    params: Params<'static>,
+    ctx: Arc<McpContext>,
+    log_message: &'static str,
+    invalid_request_log_message: &'static str,
+) -> Value {
+    let request: ToolCallRequest = match params.parse() {
+        Ok(request) => request,
+        Err(error) => {
+            error!("{invalid_request_log_message}: {}", error);
+            return invalid_tool_request_response(error);
+        }
+    };
+
+    info!(tool = %request.name, "{log_message}");
+    let response = dispatch_tool_call_with_chain(&request, &ctx.kms, &ctx.lunes_client).await;
+    serde_json::to_value(&response).expect("MCP tool result serializes to JSON value")
+}
+
+fn invalid_tool_request_response(error: impl std::fmt::Display) -> Value {
+    serde_json::json!({
+        "content": [{ "type": "text", "text": format!("Invalid request: {}", error) }],
+        "isError": true
+    })
 }
 
 async fn shutdown_signal() {

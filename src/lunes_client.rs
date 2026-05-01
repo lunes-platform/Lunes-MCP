@@ -1,4 +1,4 @@
-//! Minimal Lunes Network RPC client.
+//! Lunes Network RPC client and decoding helpers.
 
 use crate::address::encode_lunes_address;
 use blake2::{
@@ -31,6 +31,8 @@ pub struct LunesClient {
     static_staking_account: Option<StakingAccount>,
     static_validator_profiles: Option<Vec<ValidatorProfile>>,
     static_submission: Option<SignedExtrinsicSubmission>,
+    static_recent_blocks: Option<RecentBlocks>,
+    static_block_events: Option<BlockEventsLookup>,
 }
 
 impl LunesClient {
@@ -50,6 +52,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -67,6 +71,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -84,6 +90,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -101,6 +109,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -118,6 +128,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -135,6 +147,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -152,6 +166,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -169,6 +185,8 @@ impl LunesClient {
             static_staking_account: Some(staking_account),
             static_validator_profiles: None,
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -186,6 +204,8 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: Some(profiles),
             static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
         }
     }
 
@@ -203,6 +223,46 @@ impl LunesClient {
             static_staking_account: None,
             static_validator_profiles: None,
             static_submission: Some(submission),
+            static_recent_blocks: None,
+            static_block_events: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_recent_blocks(recent_blocks: RecentBlocks) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+            static_staking_account: None,
+            static_validator_profiles: None,
+            static_submission: None,
+            static_recent_blocks: Some(recent_blocks),
+            static_block_events: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_block_events(block_events: BlockEventsLookup) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+            static_staking_account: None,
+            static_validator_profiles: None,
+            static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: Some(block_events),
         }
     }
 
@@ -222,6 +282,10 @@ impl LunesClient {
     }
 
     /// Read-only call to a Lunes contract dry run.
+    ///
+    /// The return stays as `serde_json::Value` intentionally because
+    /// `contracts_call` returns contract-specific data that this gateway exposes
+    /// as an opaque RPC boundary payload until ABI-aware decoding is added.
     pub async fn fetch_contract_read(
         &self,
         contract: &str,
@@ -385,7 +449,7 @@ impl LunesClient {
                 .await
                 {
                     Ok(status) => return Ok(status),
-                    Err(error) => last_error = Some(error),
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -405,7 +469,14 @@ impl LunesClient {
         let extrinsic_hex = normalize_extrinsic_hex(extrinsic_hex)?;
         let mut last_error = None;
         for endpoint in self.endpoints.iter() {
-            match submit_signed_extrinsic(endpoint, &extrinsic_hex, wait_blocks).await {
+            match submit_signed_extrinsic(
+                endpoint,
+                self.archive_endpoint.as_deref(),
+                &extrinsic_hex,
+                wait_blocks,
+            )
+            .await
+            {
                 Ok(submission) => return Ok(submission),
                 Err(error) => last_error = Some(error),
             }
@@ -414,6 +485,82 @@ impl LunesClient {
         Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
     }
 
+    pub async fn recent_blocks(
+        &self,
+        lookback_blocks: u64,
+    ) -> Result<RecentBlocks, LunesClientError> {
+        if let Some(recent_blocks) = &self.static_recent_blocks {
+            return Ok(recent_blocks.clone());
+        }
+
+        let lookback_blocks = lookback_blocks.min(MAX_ARCHIVE_TX_LOOKBACK_BLOCKS);
+        let mut last_error = None;
+
+        if let Some(archive_endpoint) = &self.archive_endpoint {
+            match fetch_recent_blocks(archive_endpoint, lookback_blocks, "archive_rpc").await {
+                Ok(recent_blocks) => return Ok(recent_blocks),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        for endpoint in self.endpoints.iter() {
+            match fetch_recent_blocks(endpoint, lookback_blocks, "primary_or_failover_rpc").await {
+                Ok(recent_blocks) => return Ok(recent_blocks),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    pub async fn block_events(
+        &self,
+        block_hash: Option<&str>,
+        block_number: Option<u64>,
+    ) -> Result<BlockEventsLookup, LunesClientError> {
+        let block_hash = block_hash.map(normalize_32_byte_hash).transpose()?;
+
+        if let Some(block_events) = &self.static_block_events {
+            return Ok(block_events.clone());
+        }
+
+        let mut last_error = None;
+
+        if let Some(archive_endpoint) = &self.archive_endpoint {
+            match fetch_block_events_lookup(
+                archive_endpoint,
+                block_hash.as_deref(),
+                block_number,
+                "archive_rpc",
+            )
+            .await
+            {
+                Ok(block_events) => return Ok(block_events),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        for endpoint in self.endpoints.iter() {
+            match fetch_block_events_lookup(
+                endpoint,
+                block_hash.as_deref(),
+                block_number,
+                "primary_or_failover_rpc",
+            )
+            .await
+            {
+                Ok(block_events) => return Ok(block_events),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    /// Scans recent chain data and returns the MCP-facing activity summary.
+    ///
+    /// This is intentionally JSON because it is already an aggregate boundary
+    /// object consumed directly by the tool response.
     pub async fn fetch_account_activity(
         &self,
         account_id: [u8; 32],
@@ -737,12 +884,20 @@ async fn fetch_transaction_status(
         fetch_block(&client, &finalized_hash).await?
     };
 
-    Ok(TransactionStatus::from_blocks(
+    let mut status = TransactionStatus::from_blocks(
         tx_hash,
         &pending_extrinsics,
         best_block.as_ref(),
         finalized_block.as_ref(),
-    ))
+    );
+    if let Some(block_hash) = status.block_hash.as_deref() {
+        match fetch_block_events_raw(&client, block_hash).await {
+            Ok(events) => status.events = events,
+            Err(error) => status.events_lookup_error = Some(error.to_string()),
+        }
+    }
+
+    Ok(status)
 }
 
 async fn fetch_archive_transaction_status(
@@ -756,9 +911,13 @@ async fn fetch_archive_transaction_status(
     let lookup_scope = format!("archive finalized blocks, last {lookback_blocks} blocks");
 
     if let Some(block) = finalized_block.as_ref() {
-        if let Some(status) =
+        if let Some(mut status) =
             TransactionStatus::finalized_in_block(tx_hash, block, lookup_scope.clone())
         {
+            match fetch_block_events_raw(&client, &block.hash).await {
+                Ok(events) => status.events = events,
+                Err(error) => status.events_lookup_error = Some(error.to_string()),
+            }
             return Ok(status);
         }
 
@@ -771,9 +930,13 @@ async fn fetch_archive_transaction_status(
                 continue;
             };
 
-            if let Some(status) =
+            if let Some(mut status) =
                 TransactionStatus::finalized_in_block(tx_hash, &block, lookup_scope.clone())
             {
+                match fetch_block_events_raw(&client, &block.hash).await {
+                    Ok(events) => status.events = events,
+                    Err(error) => status.events_lookup_error = Some(error.to_string()),
+                }
                 return Ok(status);
             }
         }
@@ -784,26 +947,53 @@ async fn fetch_archive_transaction_status(
 
 async fn submit_signed_extrinsic(
     endpoint: &str,
+    archive_endpoint: Option<&str>,
     extrinsic_hex: &str,
     wait_blocks: u64,
 ) -> Result<SignedExtrinsicSubmission, LunesClientError> {
     let client = connect_client(endpoint).await?;
+    let expected_tx_hash = signed_extrinsic_payload_hash(extrinsic_hex)?;
     let tx_hash: String = rpc_request_params(
         &client,
         "author_submitExtrinsic",
         vec![Value::String(extrinsic_hex.to_string())],
     )
     .await?;
-    let tx_hash = normalize_32_byte_hash(&tx_hash)?;
+    let tx_hash = validate_submitted_tx_hash(&tx_hash, &expected_tx_hash)?;
     let mut status = TransactionStatus::not_found(&tx_hash, "post-submit polling".into());
     let mut events = None;
+    let mut events_lookup_error = None;
+    let mut archive_lookup_error = None;
     let attempts = wait_blocks.saturating_add(1);
 
     for attempt in 0..attempts {
         status = fetch_transaction_status(endpoint, &tx_hash).await?;
-        if let Some(block_hash) = status.block_hash.as_deref() {
-            events = fetch_block_events_raw(&client, block_hash).await?;
+        if status.status == TransactionState::NotFound {
+            if let Some(archive_endpoint) = archive_endpoint {
+                match fetch_archive_transaction_status(
+                    archive_endpoint,
+                    &tx_hash,
+                    wait_blocks.clamp(
+                        DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS,
+                        MAX_ARCHIVE_TX_LOOKBACK_BLOCKS,
+                    ),
+                )
+                .await
+                {
+                    Ok(archive_status) => {
+                        if archive_status.status != TransactionState::NotFound {
+                            archive_lookup_error = None;
+                            status = archive_status;
+                        }
+                    }
+                    Err(error) => archive_lookup_error = Some(error.to_string()),
+                }
+            }
+        } else {
+            archive_lookup_error = None;
         }
+        events = status.events.clone();
+        events_lookup_error = status.events_lookup_error.clone();
         if status.status == TransactionState::Finalized {
             break;
         }
@@ -819,9 +1009,75 @@ async fn submit_signed_extrinsic(
         block_number: status.block_number,
         extrinsic_index: status.extrinsic_index,
         events,
+        events_lookup_error,
+        archive_lookup_error,
         endpoint: endpoint.to_string(),
         wait_blocks,
         broadcasted: true,
+    })
+}
+
+async fn fetch_recent_blocks(
+    endpoint: &str,
+    lookback_blocks: u64,
+    source: &str,
+) -> Result<RecentBlocks, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let finalized_hash: String = rpc_request(&client, "chain_getFinalizedHead").await?;
+    let finalized_block = fetch_block(&client, &finalized_hash)
+        .await?
+        .ok_or_else(|| LunesClientError::InvalidRpcResponse("finalized block not found".into()))?;
+    let finalized_head = finalized_block.summary();
+    let oldest = finalized_block.number.saturating_sub(lookback_blocks);
+    let mut blocks = Vec::new();
+
+    for number in (oldest..=finalized_block.number).rev() {
+        if number == finalized_block.number {
+            blocks.push(finalized_block.summary());
+            continue;
+        }
+
+        let Some(block_hash) = fetch_block_hash_at(&client, number).await? else {
+            continue;
+        };
+        let Some(block) = fetch_block(&client, &block_hash).await? else {
+            continue;
+        };
+        blocks.push(block.summary());
+    }
+
+    Ok(RecentBlocks {
+        source: source.to_string(),
+        finalized_head,
+        lookback_blocks,
+        blocks,
+    })
+}
+
+async fn fetch_block_events_lookup(
+    endpoint: &str,
+    block_hash: Option<&str>,
+    block_number: Option<u64>,
+    source: &str,
+) -> Result<BlockEventsLookup, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let resolved_hash = match (block_hash, block_number) {
+        (Some(block_hash), _) => block_hash.to_string(),
+        (None, Some(number)) => fetch_block_hash_at(&client, number).await?.ok_or_else(|| {
+            LunesClientError::InvalidRpcResponse(format!("block hash not found for #{number}"))
+        })?,
+        (None, None) => rpc_request(&client, "chain_getFinalizedHead").await?,
+    };
+    let block = fetch_block(&client, &resolved_hash)
+        .await?
+        .ok_or_else(|| LunesClientError::InvalidRpcResponse("block not found".into()))?;
+    let events = fetch_block_events_raw(&client, &resolved_hash).await?;
+
+    Ok(BlockEventsLookup {
+        source: source.to_string(),
+        block_hash: resolved_hash,
+        block_number: Some(block.number),
+        events,
     })
 }
 
@@ -850,45 +1106,141 @@ async fn fetch_recent_account_activity(
     lookback_blocks: u64,
 ) -> Result<serde_json::Value, LunesClientError> {
     let client = connect_client(endpoint).await?;
-    let pub_hex = hex::encode(account_id);
-
-    let mut pending_activity = Vec::new();
     let pending_extrinsics: Vec<String> = rpc_request(&client, "author_pendingExtrinsics").await?;
-    for (i, ext) in pending_extrinsics.iter().enumerate() {
-        if ext.contains(&pub_hex) {
-            pending_activity.push(i);
-        }
-    }
-
-    let mut blocks_with_activity = Vec::new();
+    let mut finalized_blocks = Vec::new();
     let finalized_hash: String = rpc_request(&client, "chain_getFinalizedHead").await?;
     let finalized_block = fetch_block(&client, &finalized_hash).await?;
 
     if let Some(block) = finalized_block {
         let oldest = block.number.saturating_sub(lookback_blocks);
         for number in (oldest..=block.number).rev() {
-            let Some(block_hash) = fetch_block_hash_at(&client, number).await? else {
-                continue;
+            let block = if number == block.number {
+                Some(block.clone())
+            } else {
+                let Some(block_hash) = fetch_block_hash_at(&client, number).await? else {
+                    continue;
+                };
+                fetch_block(&client, &block_hash).await?
             };
-            let Some(b) = fetch_block(&client, &block_hash).await? else {
-                continue;
-            };
-
-            for ext in b.extrinsics {
-                if ext.contains(&pub_hex) {
-                    blocks_with_activity.push(b.number);
-                    break;
-                }
+            if let Some(block) = block {
+                finalized_blocks.push(block);
             }
         }
     }
 
-    Ok(serde_json::json!({
+    Ok(account_activity_from_chain_data(
+        account_id,
+        lookback_blocks,
+        &pending_extrinsics,
+        &finalized_blocks,
+    ))
+}
+
+fn account_activity_from_chain_data(
+    account_id: &[u8; 32],
+    lookback_blocks: u64,
+    pending_extrinsics: &[String],
+    finalized_blocks: &[RpcBlock],
+) -> serde_json::Value {
+    let pub_hex = hex::encode(account_id);
+    let mut pending_activity = Vec::new();
+    for (extrinsic_index, extrinsic) in pending_extrinsics.iter().enumerate() {
+        if ext_contains_account(extrinsic, &pub_hex) {
+            pending_activity.push(activity_entry(
+                "pending_pool",
+                None,
+                extrinsic_index,
+                extrinsic,
+            ));
+        }
+    }
+
+    let mut timeline = Vec::new();
+    let mut blocks_with_activity = Vec::new();
+    for block in finalized_blocks {
+        let mut block_matched = false;
+        for (extrinsic_index, extrinsic) in block.extrinsics.iter().enumerate() {
+            if ext_contains_account(extrinsic, &pub_hex) {
+                block_matched = true;
+                timeline.push(activity_entry(
+                    "finalized_block",
+                    Some((block.number, block.hash.as_str())),
+                    extrinsic_index,
+                    extrinsic,
+                ));
+            }
+        }
+        if block_matched {
+            blocks_with_activity.push(block.number);
+        }
+    }
+
+    serde_json::json!({
         "account": pub_hex,
         "mempool_pending_txs": pending_activity.len(),
+        "pending": pending_activity,
         "recent_active_blocks": blocks_with_activity,
+        "timeline": timeline,
+        "lookback_blocks": lookback_blocks,
+        "match_strategy": "account_id_hex_substring",
         "note": format!("Scanned last {} finalized blocks", lookback_blocks),
-    }))
+    })
+}
+
+fn ext_contains_account(extrinsic: &str, account_hex: &str) -> bool {
+    extrinsic.to_ascii_lowercase().contains(account_hex)
+}
+
+fn activity_entry(
+    source: &str,
+    block: Option<(u64, &str)>,
+    extrinsic_index: usize,
+    extrinsic: &str,
+) -> Value {
+    let mut entry = serde_json::json!({
+        "source": source,
+        "extrinsic_index": extrinsic_index,
+        "tx_hash": extrinsic_tx_hash(extrinsic),
+        "match_strategy": "account_id_hex_substring",
+    });
+
+    if let Some((block_number, block_hash)) = block {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("block_number".into(), Value::Number(block_number.into()));
+            object.insert("block_hash".into(), Value::String(block_hash.to_string()));
+        }
+    }
+
+    entry
+}
+
+fn extrinsic_tx_hash(extrinsic: &str) -> Option<String> {
+    hex_to_bytes(extrinsic)
+        .ok()
+        .map(|bytes| lunes_payload_hash_hex(&bytes))
+}
+
+pub fn redact_rpc_endpoint(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    let (authority, suffix) = rest
+        .find(['/', '?', '#'])
+        .map(|idx| rest.split_at(idx))
+        .unwrap_or((rest, ""));
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| format!("<redacted>@{host}"))
+        .unwrap_or_else(|| authority.to_string());
+    let suffix = suffix
+        .find(['?', '#'])
+        .map(|idx| {
+            let marker = suffix.as_bytes()[idx] as char;
+            format!("{}{}<redacted>", &suffix[..idx], marker)
+        })
+        .unwrap_or_else(|| suffix.to_string());
+
+    format!("{scheme}://{authority}{suffix}")
 }
 async fn connect_client(endpoint: &str) -> Result<WsClient, LunesClientError> {
     WsClientBuilder::default()
@@ -897,7 +1249,7 @@ async fn connect_client(endpoint: &str) -> Result<WsClient, LunesClientError> {
         .build(endpoint)
         .await
         .map_err(|error| LunesClientError::RpcConnection {
-            endpoint: endpoint.to_string(),
+            endpoint: redact_rpc_endpoint(endpoint),
             message: error.to_string(),
         })
 }
@@ -923,6 +1275,8 @@ async fn rpc_request_params<T>(
 where
     T: serde::de::DeserializeOwned,
 {
+    // JSON-RPC parameters are the transport boundary; callers keep responses typed
+    // whenever the returned shape is known.
     client
         .request(method, params)
         .await
@@ -1048,13 +1402,20 @@ impl NetworkHealth {
             .saturating_sub(self.finalized_block_number)
     }
 
-    pub fn status(&self) -> &'static str {
+    pub fn status(&self) -> NetworkStatus {
         if self.is_syncing || (self.should_have_peers && self.peers == 0) {
-            "degraded"
+            NetworkStatus::Degraded
         } else {
-            "healthy"
+            NetworkStatus::Healthy
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkStatus {
+    Healthy,
+    Degraded,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -1107,6 +1468,29 @@ pub struct ValidatorSet {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlockSummary {
+    pub hash: String,
+    pub number: u64,
+    pub extrinsic_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecentBlocks {
+    pub source: String,
+    pub finalized_head: BlockSummary,
+    pub lookback_blocks: u64,
+    pub blocks: Vec<BlockSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlockEventsLookup {
+    pub source: String,
+    pub block_hash: String,
+    pub block_number: Option<u64>,
+    pub events: Option<BlockEvents>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ValidatorProfile {
     pub address: String,
     pub active_session_validator: bool,
@@ -1124,7 +1508,7 @@ pub struct StakingAccount {
     pub stash_address: String,
     pub controller_address: Option<String>,
     pub bonded: bool,
-    pub roles: Vec<String>,
+    pub roles: Vec<StakingRole>,
     pub ledger: Option<StakingLedger>,
     pub reward_destination: Option<StakingRewardDestination>,
     pub nominations: Option<Nominations>,
@@ -1153,8 +1537,60 @@ pub struct UnlockChunk {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StakingRewardDestination {
-    pub destination: String,
+    pub destination: StakingRewardDestinationKind,
     pub account: Option<String>,
+}
+
+impl StakingRewardDestination {
+    pub fn payload_value(&self) -> String {
+        match &self.account {
+            Some(account) => format!("{}:{account}", self.destination.as_str()),
+            None => self.destination.as_str().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StakingRewardDestinationKind {
+    Staked,
+    Stash,
+    Controller,
+    Account,
+    None,
+    Unknown,
+}
+
+impl StakingRewardDestinationKind {
+    pub fn from_tool_arg(value: &str) -> Option<Self> {
+        match value {
+            "staked" => Some(Self::Staked),
+            "stash" => Some(Self::Stash),
+            "controller" => Some(Self::Controller),
+            "account" => Some(Self::Account),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staked => "staked",
+            Self::Stash => "stash",
+            Self::Controller => "controller",
+            Self::Account => "account",
+            Self::None => "none",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StakingRole {
+    Bonded,
+    Nominator,
+    Validator,
+    Idle,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1179,6 +1615,8 @@ pub struct SignedExtrinsicSubmission {
     pub block_number: Option<u64>,
     pub extrinsic_index: Option<usize>,
     pub events: Option<BlockEvents>,
+    pub events_lookup_error: Option<String>,
+    pub archive_lookup_error: Option<String>,
     pub endpoint: String,
     pub wait_blocks: u64,
     pub broadcasted: bool,
@@ -1198,6 +1636,8 @@ pub struct TransactionStatus {
     pub block_hash: Option<String>,
     pub block_number: Option<u64>,
     pub extrinsic_index: Option<usize>,
+    pub events: Option<BlockEvents>,
+    pub events_lookup_error: Option<String>,
     pub lookup_scope: String,
 }
 
@@ -1260,6 +1700,8 @@ impl TransactionStatus {
                 block_hash: None,
                 block_number: None,
                 extrinsic_index: None,
+                events: None,
+                events_lookup_error: None,
                 lookup_scope,
             };
         }
@@ -1287,6 +1729,8 @@ impl TransactionStatus {
             block_hash: None,
             block_number: None,
             extrinsic_index: None,
+            events: None,
+            events_lookup_error: None,
             lookup_scope,
         }
     }
@@ -1305,6 +1749,8 @@ impl TransactionStatus {
             block_hash: Some(block_hash),
             block_number: Some(block_number),
             extrinsic_index: Some(extrinsic_index),
+            events: None,
+            events_lookup_error: None,
             lookup_scope,
         }
     }
@@ -1362,6 +1808,14 @@ impl RpcBlock {
         self.extrinsics
             .iter()
             .position(|extrinsic| extrinsic_hash_matches(extrinsic, tx_hash))
+    }
+
+    fn summary(&self) -> BlockSummary {
+        BlockSummary {
+            hash: self.hash.clone(),
+            number: self.number,
+            extrinsic_count: self.extrinsics.len(),
+        }
     }
 }
 
@@ -1708,12 +2162,12 @@ fn decode_reward_destination(storage: &str) -> Result<StakingRewardDestination, 
     };
 
     let destination = match kind {
-        0 => "staked",
-        1 => "stash",
-        2 => "controller",
-        3 => "account",
-        4 => "none",
-        _ => "unknown",
+        0 => StakingRewardDestinationKind::Staked,
+        1 => StakingRewardDestinationKind::Stash,
+        2 => StakingRewardDestinationKind::Controller,
+        3 => StakingRewardDestinationKind::Account,
+        4 => StakingRewardDestinationKind::None,
+        _ => StakingRewardDestinationKind::Unknown,
     };
     let account = if *kind == 3 {
         let account_id = account_id_from_slice(&bytes[1..])?;
@@ -1723,7 +2177,7 @@ fn decode_reward_destination(storage: &str) -> Result<StakingRewardDestination, 
     };
 
     Ok(StakingRewardDestination {
-        destination: destination.into(),
+        destination,
         account,
     })
 }
@@ -1770,19 +2224,19 @@ fn format_perbill_percent(value: u32) -> String {
     format!("{whole}.{fractional:04}")
 }
 
-fn staking_roles(bonded: bool, nominator: bool, validator: bool) -> Vec<String> {
+fn staking_roles(bonded: bool, nominator: bool, validator: bool) -> Vec<StakingRole> {
     let mut roles = Vec::new();
     if bonded {
-        roles.push("bonded".into());
+        roles.push(StakingRole::Bonded);
     }
     if nominator {
-        roles.push("nominator".into());
+        roles.push(StakingRole::Nominator);
     }
     if validator {
-        roles.push("validator".into());
+        roles.push(StakingRole::Validator);
     }
     if roles.is_empty() {
-        roles.push("idle".into());
+        roles.push(StakingRole::Idle);
     }
     roles
 }
@@ -1950,6 +2404,20 @@ fn normalize_32_byte_hash(hash: &str) -> Result<String, LunesClientError> {
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
+fn validate_submitted_tx_hash(
+    returned_tx_hash: &str,
+    expected_tx_hash: &str,
+) -> Result<String, LunesClientError> {
+    let returned_tx_hash = normalize_32_byte_hash(returned_tx_hash)?;
+    if !returned_tx_hash.eq_ignore_ascii_case(expected_tx_hash) {
+        return Err(LunesClientError::InvalidRpcResponse(format!(
+            "author_submitExtrinsic returned tx hash {returned_tx_hash}, but signed extrinsic hash is {expected_tx_hash}"
+        )));
+    }
+
+    Ok(returned_tx_hash)
+}
+
 fn normalize_extrinsic_hex(extrinsic: &str) -> Result<String, LunesClientError> {
     let bytes = decode_hex_string(extrinsic).map_err(LunesClientError::InvalidSignedExtrinsic)?;
     if bytes.is_empty() {
@@ -1959,6 +2427,12 @@ fn normalize_extrinsic_hex(extrinsic: &str) -> Result<String, LunesClientError> 
     }
 
     Ok(format!("0x{}", hex::encode(bytes)))
+}
+
+pub fn signed_extrinsic_payload_hash(extrinsic: &str) -> Result<String, LunesClientError> {
+    let normalized = normalize_extrinsic_hex(extrinsic)?;
+    let bytes = decode_hex_string(&normalized).map_err(LunesClientError::InvalidSignedExtrinsic)?;
+    Ok(lunes_payload_hash_hex(&bytes))
 }
 
 fn lunes_payload_hash_hex(payload: &[u8]) -> String {
@@ -2116,7 +2590,7 @@ mod tests {
     #[test]
     fn decodes_reward_destination_and_validator_prefs() {
         let payee = decode_reward_destination("0x00").unwrap();
-        assert_eq!(payee.destination, "staked");
+        assert_eq!(payee.destination, StakingRewardDestinationKind::Staked);
         assert_eq!(payee.account, None);
 
         let mut prefs = compact_u128(390_625);
@@ -2198,11 +2672,102 @@ mod tests {
     }
 
     #[test]
+    fn rpc_block_summary_counts_extrinsics() {
+        let block = RpcBlock::from_rpc(
+            format!("0x{}", "ab".repeat(32)),
+            serde_json::json!({
+                "block": {
+                    "header": { "number": "0x2a" },
+                    "extrinsics": ["0x00", "0x01", "0x02"]
+                }
+            }),
+        )
+        .unwrap();
+
+        let summary = block.summary();
+
+        assert_eq!(summary.hash, format!("0x{}", "ab".repeat(32)));
+        assert_eq!(summary.number, 42);
+        assert_eq!(summary.extrinsic_count, 3);
+    }
+
+    #[test]
+    fn account_activity_timeline_includes_block_and_extrinsic_hash() {
+        let account_id = [9u8; 32];
+        let matching_extrinsic = format!("0x00{}ff", hex::encode(account_id));
+        let other_extrinsic = "0x01020304";
+        let block = RpcBlock::from_rpc(
+            format!("0x{}", "cd".repeat(32)),
+            serde_json::json!({
+                "block": {
+                    "header": { "number": "0x2a" },
+                    "extrinsics": [other_extrinsic, matching_extrinsic.clone()]
+                }
+            }),
+        )
+        .unwrap();
+
+        let activity =
+            account_activity_from_chain_data(&account_id, 4, &[matching_extrinsic], &[block]);
+
+        assert_eq!(activity["mempool_pending_txs"], 1);
+        assert_eq!(activity["pending"][0]["source"], "pending_pool");
+        assert_eq!(activity["timeline"][0]["source"], "finalized_block");
+        assert_eq!(activity["timeline"][0]["block_number"], 42);
+        assert_eq!(activity["timeline"][0]["extrinsic_index"], 1);
+        assert_eq!(
+            activity["timeline"][0]["match_strategy"],
+            "account_id_hex_substring"
+        );
+    }
+
+    #[test]
     fn normalizes_signed_extrinsic_hex() {
         assert_eq!(normalize_extrinsic_hex("010203").unwrap(), "0x010203");
         assert_eq!(normalize_extrinsic_hex("0x010203").unwrap(), "0x010203");
         assert!(normalize_extrinsic_hex("0x").is_err());
         assert!(normalize_extrinsic_hex("0x0").is_err());
+    }
+
+    #[test]
+    fn hashes_signed_extrinsic_payload_after_normalization() {
+        assert_eq!(
+            signed_extrinsic_payload_hash("010203").unwrap(),
+            signed_extrinsic_payload_hash("0x010203").unwrap()
+        );
+    }
+
+    #[test]
+    fn redacts_rpc_endpoint_credentials_and_query() {
+        assert_eq!(
+            redact_rpc_endpoint("wss://user:secret@rpc.example/ws?token=abc"),
+            "wss://<redacted>@rpc.example/ws?<redacted>"
+        );
+        assert_eq!(
+            redact_rpc_endpoint("wss://user:secret@rpc.example/ws#frag"),
+            "wss://<redacted>@rpc.example/ws#<redacted>"
+        );
+        assert_eq!(
+            redact_rpc_endpoint("wss://rpc.example/ws?token=abc#frag"),
+            "wss://rpc.example/ws?<redacted>"
+        );
+        assert_eq!(
+            redact_rpc_endpoint("wss://rpc.example/ws"),
+            "wss://rpc.example/ws"
+        );
+    }
+
+    #[test]
+    fn rejects_rpc_submit_hash_mismatch() {
+        let expected = format!("0x{}", "11".repeat(32));
+        let returned = format!("0x{}", "22".repeat(32));
+
+        let result = validate_submitted_tx_hash(&returned, &expected);
+
+        assert!(matches!(
+            result,
+            Err(LunesClientError::InvalidRpcResponse(_))
+        ));
     }
 
     #[tokio::test]
@@ -2221,6 +2786,8 @@ mod tests {
                 raw_storage: "0x00".into(),
                 decoded: false,
             }),
+            events_lookup_error: None,
+            archive_lookup_error: None,
             endpoint: "memory://lunes".into(),
             wait_blocks: 0,
             broadcasted: true,

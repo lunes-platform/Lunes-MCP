@@ -9,10 +9,15 @@
   <img src="assets/lunes-mcp-hero.png" alt="Lunes MCP Server secure gateway" width="100%">
 </p>
 
-Secure MCP access to Lunes Network tooling.
+Secure MCP access to the Lunes Blockchain.
 
-Lunes MCP Server is a local-first gateway that exposes Lunes account, transaction,
-wallet delegation, and transaction preparation tools to MCP-compatible agents.
+The Lunes Blockchain is the network where LUNES accounts, assets, staking,
+validators, contracts, and transaction workflows live. Lunes MCP Server gives
+MCP-compatible agents a controlled gateway into that environment: they can read
+live chain state, inspect balances and validators, prepare actions for human
+review, and relay explicitly approved transactions without receiving unrestricted
+wallet authority.
+
 It runs as a small JSON-RPC HTTP service with conservative defaults: localhost
 binding, prepare-only mode, API-key protection for public binds, rate limiting,
 and policy checks before any local signing path is reached.
@@ -57,7 +62,7 @@ The server is built to fail closed.
 - Empty destination whitelists block all write destinations.
 - Staking tools require the `staking` policy target in the whitelist; validator and reward-account addresses must also be whitelisted.
 - Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1`.
-- Broadcasting a human-signed extrinsic requires explicit local opt-in with `LUNES_MCP_ENABLE_BROADCAST=1` and `confirm_broadcast=true`.
+- Broadcasting a human-signed extrinsic requires `LUNES_MCP_ENABLE_BROADCAST=1`, a pre-approved signed payload hash, `confirm_broadcast=true`, and agent policy allowing `author.submit_extrinsic` to the `broadcast` target.
 - Read-only contract simulation requires message-level allowlists; autonomous contract writes remain disabled until asset-specific limits are available.
 
 ## Agent Capabilities
@@ -72,7 +77,7 @@ action passes through explicit server-side policy.
 | Asset visibility | List native LUNES plus allowlisted PSP22 contracts, and dry-run token balance reads through live RPC |
 | Network awareness | Read live Lunes Network metadata, health, peers, finality lag, token settings, address format, and runtime version |
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
-| Transaction awareness | Check pending pool, current heads, and the archive endpoint for a transaction hash |
+| Transaction awareness | Check pending pool, current heads, recent finalized block summaries, raw block events, and account activity timelines |
 | Human-signed transaction submission | Broadcast an externally signed Lunes extrinsic and poll for inclusion/finality when explicitly enabled |
 | Validator visibility | Read the current validator set and expose bounded samples to agents |
 | Validator profiles | Inspect active-set status, commission, blocked state, and nomination eligibility hints |
@@ -227,10 +232,26 @@ gated:
 
 ```bash
 export LUNES_MCP_ENABLE_BROADCAST=1
+export LUNES_MCP_ALLOWED_BROADCAST_HASHES="0x..."
 ```
 
-Only enable this in an operator-controlled environment. The server does not
-decode or verify the contents of a raw signed payload before submitting it.
+Only enable this in an operator-controlled environment. The server computes the
+signed payload hash and requires it to be pre-approved in
+`LUNES_MCP_ALLOWED_BROADCAST_HASHES`. Agent policy must also include
+`author.submit_extrinsic` in `allowed_extrinsics` and `broadcast` in
+`whitelisted_addresses`. The relay still does not decode or verify the contents
+of a raw signed payload before submitting it.
+
+Optional persistent audit logging can be enabled with:
+
+```bash
+export LUNES_MCP_AUDIT_LOG_PATH="/var/log/lunes-mcp/audit.jsonl"
+```
+
+Each JSONL entry stores action metadata, destination, result, and a payload hash;
+raw signing payload bytes are not written to the log. When this path is
+configured, successful local KMS signing fails closed if the persistent audit
+entry cannot be written.
 
 ## Client Setup
 
@@ -414,8 +435,10 @@ use a client with HTTP MCP transport support.
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
 | `lunes_get_transaction_status` | Read | Checks pending pool, current heads, and archive endpoint for a transaction hash; `archive_lookback_blocks` can widen the bounded archive search |
-| `lunes_submit_signed_extrinsic` | Write | Broadcasts an externally signed Lunes extrinsic when `LUNES_MCP_ENABLE_BROADCAST=1` and `confirm_broadcast=true`, then polls for inclusion/finality |
-| `lunes_search_account_activity` | Read | Searches pending transactions and recent finalized blocks for account activity |
+| `lunes_submit_signed_extrinsic` | Write | Broadcasts an externally signed Lunes extrinsic when env opt-in, signed hash preapproval, `confirm_broadcast=true`, and `author.submit_extrinsic` -> `broadcast` policy all pass, then polls for inclusion/finality |
+| `lunes_get_recent_blocks` | Read | Lists recent finalized block summaries without returning raw extrinsics |
+| `lunes_get_block_events` | Read | Reads raw event storage for a block by hash, number, or finalized head |
+| `lunes_search_account_activity` | Read | Searches pending transactions and recent finalized blocks for bounded account activity, including timeline entries |
 | `lunes_read_contract` | Read | Simulates a read-only Lunes contract call through live RPC when allowed by contract message policy |
 | `lunes_search_contract` | Read | Looks up Lunes contract interface metadata |
 | `lunes_transfer_native` | Write | Prepares or signs a native LUNES transfer |
@@ -433,7 +456,8 @@ use a client with HTTP MCP transport support.
 Write tools are checked against policy before signing. Local intent-signing
 responses still include `broadcasted: false`; `lunes_submit_signed_extrinsic`
 is the separate relay path for payloads that were already signed outside this
-server.
+server. Contract write tools require explicit contract/message allowlists; an
+empty method list does not grant wildcard contract access.
 
 ## Specifications
 
@@ -498,3 +522,7 @@ Key points:
 - Do not expose the server publicly without authentication and TLS termination.
 - Treat autonomous signing as experimental until final transaction construction and signing are fully implemented.
 - Review `agent_config.toml` carefully before enabling any write tool.
+- Pre-approve only exact signed extrinsic hashes for relay, and rotate the
+  allowlist after use.
+- Set `LUNES_MCP_AUDIT_LOG_PATH` to an append-only location owned by the server
+  user when persistent audit retention is required.

@@ -101,8 +101,8 @@ mod tests {
 
     #[test]
     fn rejects_non_lunes_prefix() {
-        let polkadot_development_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-        let error = validate_lunes_address(polkadot_development_address).unwrap_err();
+        let wrong_network_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+        let error = validate_lunes_address(wrong_network_address).unwrap_err();
 
         assert_eq!(
             error,

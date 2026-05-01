@@ -9,16 +9,145 @@
 //! - Enables `zeroize` support in `ed25519-dalek` for private key cleanup.
 //! - Blocks accidental key replacement; call `revoke_key()` before reprovisioning.
 
-use chrono::{DateTime, Duration, Utc};
+use blake2::{
+    digest::{Update, VariableOutput},
+    Blake2bVar,
+};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
+use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{Error, ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::config::{AgentMode, PermissionsConfig};
 
-// --- KMS errors ----------------------------------------------------------
+const MAX_AUDIT_LOG_ENTRIES: usize = 1024;
+pub const AUDIT_LOG_PATH_ENV: &str = "LUNES_MCP_AUDIT_LOG_PATH";
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+fn audit_log_path_from_env() -> Option<PathBuf> {
+    std::env::var(AUDIT_LOG_PATH_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn audit_payload_hash(payload_bytes: &[u8]) -> String {
+    let mut hasher = Blake2bVar::new(32).expect("32-byte Blake2b output size is valid");
+    hasher.update(payload_bytes);
+    let mut output = [0u8; 32];
+    hasher
+        .finalize_variable(&mut output)
+        .expect("fixed-size output buffer has the requested length");
+    format!("0x{}", hex::encode(output))
+}
+
+fn append_persistent_audit_entry(path: &Path, entry: &AuditEntry) -> std::io::Result<()> {
+    validate_audit_log_path_before_open(path)?;
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(path)?;
+    validate_open_audit_log_file(&file)?;
+    serde_json::to_writer(&mut file, entry).map_err(std::io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.flush()
+}
+
+fn validate_audit_log_path_before_open(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_existing_audit_log_metadata(path, &metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_existing_audit_log_metadata(path: &Path, metadata: &Metadata) -> std::io::Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("audit log path must not be a symlink: {}", path.display()),
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("audit log path must be a regular file: {}", path.display()),
+        ));
+    }
+
+    validate_audit_log_metadata_permissions(path, metadata)
+}
+
+fn validate_open_audit_log_file(file: &File) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "audit log path must be a regular file",
+        ));
+    }
+    validate_audit_log_metadata_permissions(Path::new("<opened-audit-log>"), &metadata)
+}
+
+#[cfg(unix)]
+fn validate_audit_log_metadata_permissions(
+    path: &Path,
+    metadata: &Metadata,
+) -> std::io::Result<()> {
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "audit log path must not be readable or writable by group/other: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    if metadata.uid() != current_effective_uid() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "audit log path must be owned by the server user: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_audit_log_metadata_permissions(
+    _path: &Path,
+    _metadata: &Metadata,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { geteuid() }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum KmsError {
@@ -42,6 +171,12 @@ pub enum KmsError {
 
     #[error("Destination '{0}' is not in the whitelist.")]
     UnauthorizedDestination(String),
+
+    #[error("Contract method '{method}' is not allowlisted for contract '{contract}'.")]
+    UnauthorizedContractMessage { contract: String, method: String },
+
+    #[error("Persistent audit log write failed: {0}")]
+    AuditLogPersistenceFailed(String),
 }
 
 impl KmsError {
@@ -55,27 +190,61 @@ impl KmsError {
             KmsError::DailyLimitExceeded { .. } => -32010,
             KmsError::UnauthorizedExtrinsic(_) => -32011,
             KmsError::UnauthorizedDestination(_) => -32011,
+            KmsError::UnauthorizedContractMessage { .. } => -32011,
+            KmsError::AuditLogPersistenceFailed(_) => -32012,
         }
     }
 }
 
-// --- Audit log -----------------------------------------------------------
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
     pub timestamp: DateTime<Utc>,
-    pub action: String,
+    pub action: AuditAction,
     pub extrinsic: String,
+    pub destination: Option<String>,
     pub amount_lunes: u64,
+    pub payload_hash: Option<String>,
     pub success: bool,
     pub error: Option<String>,
 }
 
-// --- Spending tracker ----------------------------------------------------
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum AuditAction {
+    #[serde(rename = "SIGN")]
+    Sign,
+    #[serde(rename = "DENIED")]
+    Denied,
+}
+
+impl AuditEntry {
+    fn new(
+        extrinsic: &str,
+        destination: Option<&str>,
+        amount_lunes: u64,
+        payload_hash: Option<&str>,
+        success: bool,
+        error: Option<&str>,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            action: if success {
+                AuditAction::Sign
+            } else {
+                AuditAction::Denied
+            },
+            extrinsic: extrinsic.to_string(),
+            destination: destination.map(str::to_string),
+            amount_lunes,
+            payload_hash: payload_hash.map(str::to_string),
+            success,
+            error: error.map(str::to_string),
+        }
+    }
+}
 
 struct SpendingTracker {
     /// Map of UTC day -> amount spent that day.
-    daily_totals: HashMap<String, u64>,
+    daily_totals: HashMap<NaiveDate, u64>,
     limit: u64,
 }
 
@@ -87,52 +256,34 @@ impl SpendingTracker {
         }
     }
 
-    fn current_day_key() -> String {
-        Utc::now().format("%Y-%m-%d").to_string()
+    fn current_day_key() -> NaiveDate {
+        Utc::now().date_naive()
     }
 
-    /// Checks whether an amount fits within the daily limit.
     fn check(&self, amount: u64) -> Result<(), KmsError> {
         let today = Self::current_day_key();
         let spent = *self.daily_totals.get(&today).unwrap_or(&0);
-        let next_spent = spent
-            .checked_add(amount)
-            .ok_or(KmsError::DailyLimitExceeded {
-                spent,
-                limit: self.limit,
-            })?;
-
-        if next_spent > self.limit {
-            return Err(KmsError::DailyLimitExceeded {
-                spent,
-                limit: self.limit,
-            });
-        }
-
-        Ok(())
+        Self::checked_next_spent(self.limit, spent, amount).map(|_| ())
     }
 
-    /// Checks and records an amount against the daily limit.
     fn check_and_record(&mut self, amount: u64) -> Result<u64, KmsError> {
         let today = Self::current_day_key();
         let spent = self.daily_totals.entry(today).or_insert(0);
-
-        let next_spent = spent
-            .checked_add(amount)
-            .ok_or(KmsError::DailyLimitExceeded {
-                spent: *spent,
-                limit: self.limit,
-            })?;
-
-        if next_spent > self.limit {
-            return Err(KmsError::DailyLimitExceeded {
-                spent: *spent,
-                limit: self.limit,
-            });
-        }
-
+        let next_spent = Self::checked_next_spent(self.limit, *spent, amount)?;
         *spent = next_spent;
         Ok(*spent)
+    }
+
+    fn checked_next_spent(limit: u64, spent: u64, amount: u64) -> Result<u64, KmsError> {
+        let next_spent = spent
+            .checked_add(amount)
+            .ok_or(KmsError::DailyLimitExceeded { spent, limit })?;
+
+        if next_spent > limit {
+            return Err(KmsError::DailyLimitExceeded { spent, limit });
+        }
+
+        Ok(next_spent)
     }
 
     fn spent_today(&self) -> u64 {
@@ -147,39 +298,37 @@ impl SpendingTracker {
     }
 }
 
-// --- Internal state ------------------------------------------------------
-
 struct KmsState {
     /// Private signing key. Never exposed through the API.
     signing_key: Option<SigningKey>,
-
-    /// Derived public key.
     public_key: Option<VerifyingKey>,
-
-    /// Provisioning timestamp.
     provisioned_at: Option<DateTime<Utc>>,
-
-    /// Daily spending tracker.
     spending: SpendingTracker,
-
-    /// In-memory audit log.
     audit_log: Vec<AuditEntry>,
 }
-
-// --- Agent KMS -----------------------------------------------------------
 
 pub struct AgentKms {
     mode: AgentMode,
     permissions: PermissionsConfig,
+    audit_log_path: Option<PathBuf>,
     state: Mutex<KmsState>,
 }
 
 impl AgentKms {
     pub fn new(mode: AgentMode, permissions: PermissionsConfig) -> Self {
+        Self::new_with_optional_audit_log_path(mode, permissions, audit_log_path_from_env())
+    }
+
+    fn new_with_optional_audit_log_path(
+        mode: AgentMode,
+        permissions: PermissionsConfig,
+        audit_log_path: Option<PathBuf>,
+    ) -> Self {
         let limit = permissions.daily_limit_lunes;
         Self {
             mode,
             permissions,
+            audit_log_path,
             state: Mutex::new(KmsState {
                 signing_key: None,
                 public_key: None,
@@ -189,8 +338,6 @@ impl AgentKms {
             }),
         }
     }
-
-    // Provisioning
 
     /// Generates a new Ed25519 keypair and returns the public key as hex.
     ///
@@ -257,19 +404,15 @@ impl AgentKms {
         method_name: &str,
     ) -> Result<(), KmsError> {
         if let Some(allowed_methods) = self.permissions.allowlist_contracts.get(contract_address) {
-            // An empty method list means every message on this contract is allowed.
-            if allowed_methods.is_empty() {
-                return Ok(());
-            }
-
             if allowed_methods.iter().any(|m| m == method_name) {
                 return Ok(());
             }
         }
 
-        Err(KmsError::UnauthorizedDestination(
-            contract_address.to_string(),
-        ))
+        Err(KmsError::UnauthorizedContractMessage {
+            contract: contract_address.to_string(),
+            method: method_name.to_string(),
+        })
     }
 
     pub fn permissions(&self) -> &PermissionsConfig {
@@ -281,8 +424,6 @@ impl AgentKms {
         let state = self.state.lock();
         state.signing_key.is_some() && self.check_ttl_inner(&state).is_ok()
     }
-
-    // Policy validation
 
     fn check_ttl_inner(&self, state: &KmsState) -> Result<(), KmsError> {
         if self.permissions.ttl_hours == 0 {
@@ -347,20 +488,7 @@ impl AgentKms {
         state.spending.check(amount_lunes)
     }
 
-    // Signing
-
-    /// Validates all policies and signs the payload.
-    ///
-    /// Before using the private key, the KMS checks mode, key lifecycle,
-    /// extrinsic allowlist, destination whitelist, and daily spending limit.
-    ///
-    /// ## Validation Pipeline
-    /// 1. Autonomous mode enabled?
-    /// 2. Agent key provisioned?
-    /// 3. TTL valid?
-    /// 4. Extrinsic allowed?
-    /// 5. Destination whitelisted?
-    /// 6. Daily limit available?
+    /// Validates mode, key lifecycle, allowlists, and daily budget before signing.
     pub fn sign_payload(
         &self,
         extrinsic: &str,
@@ -368,76 +496,102 @@ impl AgentKms {
         amount_lunes: u64,
         payload_bytes: &[u8],
     ) -> Result<SignedResult, KmsError> {
-        // 1. Autonomous mode?
+        let payload_hash = audit_payload_hash(payload_bytes);
+
         if self.mode != AgentMode::Autonomous {
-            self.log_audit(extrinsic, amount_lunes, false, Some("NotAutonomous"));
+            self.log_audit(
+                extrinsic,
+                Some(destination),
+                amount_lunes,
+                Some(&payload_hash),
+                false,
+                Some("NotAutonomous"),
+            );
             return Err(KmsError::NotAutonomous);
         }
 
         // One lock covers the full operation to keep state consistent.
         let mut state = self.state.lock();
 
-        // 2. Key provisioned?
         if state.signing_key.is_none() {
-            Self::log_audit_inner(
-                &mut state.audit_log,
+            self.log_denied_audit(
+                &mut state,
                 extrinsic,
+                destination,
                 amount_lunes,
-                false,
-                Some("NotInitialized"),
+                &payload_hash,
+                "NotInitialized",
             );
             return Err(KmsError::NotInitialized);
         }
 
-        // 3. TTL valid?
         if let Err(e) = self.check_ttl_inner(&state) {
-            Self::log_audit_inner(
-                &mut state.audit_log,
+            self.log_denied_audit(
+                &mut state,
                 extrinsic,
+                destination,
                 amount_lunes,
-                false,
-                Some("TtlExpired"),
+                &payload_hash,
+                "TtlExpired",
             );
             return Err(e);
         }
 
-        // 4. Extrinsic allowed?
         if let Err(e) = self.check_extrinsic(extrinsic) {
-            Self::log_audit_inner(
-                &mut state.audit_log,
+            self.log_denied_audit(
+                &mut state,
                 extrinsic,
+                destination,
                 amount_lunes,
-                false,
-                Some("UnauthorizedExtrinsic"),
+                &payload_hash,
+                "UnauthorizedExtrinsic",
             );
             return Err(e);
         }
 
-        // 5. Destination whitelisted?
         if let Err(e) = self.check_destination(destination) {
-            Self::log_audit_inner(
-                &mut state.audit_log,
+            self.log_denied_audit(
+                &mut state,
                 extrinsic,
+                destination,
                 amount_lunes,
-                false,
-                Some("UnauthorizedDestination"),
+                &payload_hash,
+                "UnauthorizedDestination",
             );
             return Err(e);
         }
 
-        // 6. Daily limit available?
-        if let Err(e) = state.spending.check_and_record(amount_lunes) {
-            Self::log_audit_inner(
-                &mut state.audit_log,
+        if let Err(e) = state.spending.check(amount_lunes) {
+            self.log_denied_audit(
+                &mut state,
                 extrinsic,
+                destination,
                 amount_lunes,
-                false,
-                Some("DailyLimitExceeded"),
+                &payload_hash,
+                "DailyLimitExceeded",
             );
             return Err(e);
         }
 
-        // All checks passed; sign with the local key.
+        Self::log_audit_inner(
+            &mut state.audit_log,
+            self.audit_log_path.as_deref(),
+            AuditEntry::new(
+                extrinsic,
+                Some(destination),
+                amount_lunes,
+                Some(&payload_hash),
+                true,
+                None,
+            ),
+        )
+        .map_err(|error| KmsError::AuditLogPersistenceFailed(error.to_string()))?;
+
+        state
+            .spending
+            .check_and_record(amount_lunes)
+            .expect("spending was checked while holding the same KMS lock");
+
         let (sig_hex, pub_hex) = {
             let signing_key = state
                 .signing_key
@@ -449,8 +603,6 @@ impl AgentKms {
                 hex::encode(signing_key.verifying_key().as_bytes()),
             )
         };
-
-        Self::log_audit_inner(&mut state.audit_log, extrinsic, amount_lunes, true, None);
 
         info!(
             extrinsic = extrinsic,
@@ -464,34 +616,74 @@ impl AgentKms {
         })
     }
 
-    // Audit
-
-    fn log_audit(&self, extrinsic: &str, amount: u64, success: bool, error: Option<&str>) {
+    fn log_audit(
+        &self,
+        extrinsic: &str,
+        destination: Option<&str>,
+        amount: u64,
+        payload_hash: Option<&str>,
+        success: bool,
+        error: Option<&str>,
+    ) {
         let mut state = self.state.lock();
-        Self::log_audit_inner(&mut state.audit_log, extrinsic, amount, success, error);
+        Self::log_audit_inner(
+            &mut state.audit_log,
+            self.audit_log_path.as_deref(),
+            AuditEntry::new(extrinsic, destination, amount, payload_hash, success, error),
+        )
+        .unwrap_or_else(|error| self.warn_audit_persistence_failure(error));
+    }
+
+    fn log_denied_audit(
+        &self,
+        state: &mut KmsState,
+        extrinsic: &str,
+        destination: &str,
+        amount_lunes: u64,
+        payload_hash: &str,
+        reason: &'static str,
+    ) {
+        Self::log_audit_inner(
+            &mut state.audit_log,
+            self.audit_log_path.as_deref(),
+            AuditEntry::new(
+                extrinsic,
+                Some(destination),
+                amount_lunes,
+                Some(payload_hash),
+                false,
+                Some(reason),
+            ),
+        )
+        .unwrap_or_else(|error| self.warn_audit_persistence_failure(error));
     }
 
     /// Internal version that operates on the audit vector while the caller holds the lock.
     fn log_audit_inner(
         audit_log: &mut Vec<AuditEntry>,
-        extrinsic: &str,
-        amount: u64,
-        success: bool,
-        error: Option<&str>,
-    ) {
-        let entry = AuditEntry {
-            timestamp: Utc::now(),
-            action: if success {
-                "SIGN".into()
-            } else {
-                "DENIED".into()
-            },
-            extrinsic: extrinsic.to_string(),
-            amount_lunes: amount,
-            success,
-            error: error.map(|s| s.to_string()),
-        };
+        audit_log_path: Option<&Path>,
+        entry: AuditEntry,
+    ) -> std::io::Result<()> {
+        if let Some(path) = audit_log_path {
+            append_persistent_audit_entry(path, &entry)?;
+        }
+
+        if audit_log.len() >= MAX_AUDIT_LOG_ENTRIES {
+            audit_log.remove(0);
+        }
         audit_log.push(entry);
+
+        Ok(())
+    }
+
+    fn warn_audit_persistence_failure(&self, error: std::io::Error) {
+        if let Some(path) = &self.audit_log_path {
+            warn!(
+                audit_log_path = %path.display(),
+                error = %error,
+                "Failed to append persistent KMS audit entry"
+            );
+        }
     }
 
     /// Returns a copy of the audit log.
@@ -505,15 +697,11 @@ impl AgentKms {
     }
 }
 
-// --- Signed result -------------------------------------------------------
-
 #[derive(Debug)]
 pub struct SignedResult {
     pub signature: String,
     pub public_key: String,
 }
-
-// --- Tests ---------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -549,7 +737,7 @@ mod tests {
         let second = kms.provision_key();
         assert!(second.is_err());
         match second.unwrap_err() {
-            KmsError::AlreadyProvisioned => {} // expected
+            KmsError::AlreadyProvisioned => {}
             e => panic!("Expected AlreadyProvisioned, got {:?}", e),
         }
     }
@@ -629,11 +817,9 @@ mod tests {
         let kms = AgentKms::new(AgentMode::Autonomous, test_permissions());
         kms.provision_key().unwrap();
 
-        // Spend 90: allowed.
         let r1 = kms.sign_payload("balances.transfer", "5Gxyz", 90, b"tx1");
         assert!(r1.is_ok());
 
-        // Spend 20 more: blocked because total would be 110 > 100.
         let r2 = kms.sign_payload("balances.transfer", "5Gxyz", 20, b"tx2");
         assert!(r2.is_err());
         assert_eq!(r2.unwrap_err().error_code(), -32010);
@@ -717,17 +903,165 @@ mod tests {
     }
 
     #[test]
+    fn test_audit_log_is_bounded() {
+        let kms = AgentKms::new(AgentMode::Autonomous, test_permissions());
+        kms.provision_key().unwrap();
+
+        for _ in 0..(MAX_AUDIT_LOG_ENTRIES + 10) {
+            let _ = kms.sign_payload("staking.bond", "5G", 1, b"fail");
+        }
+
+        let log = kms.get_audit_log();
+        assert_eq!(log.len(), MAX_AUDIT_LOG_ENTRIES);
+    }
+
+    #[test]
+    fn test_persistent_audit_log_writes_jsonl_without_payload() {
+        let path = std::env::temp_dir().join(format!(
+            "lunes-mcp-audit-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let kms = AgentKms::new_with_optional_audit_log_path(
+            AgentMode::Autonomous,
+            test_permissions(),
+            Some(path.clone()),
+        );
+        kms.provision_key().unwrap();
+
+        kms.sign_payload("balances.transfer", "5G", 10, b"secret payload")
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(contents.contains("\"action\":\"SIGN\""));
+        assert!(contents.contains("\"destination\":\"5G\""));
+        assert!(contents.contains("\"payload_hash\":\"0x"));
+        assert!(!contents.contains("secret payload"));
+    }
+
+    #[test]
+    fn test_persistent_audit_log_failure_blocks_successful_signing() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "lunes-mcp-missing-audit-dir-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("audit.jsonl");
+        let kms = AgentKms::new_with_optional_audit_log_path(
+            AgentMode::Autonomous,
+            test_permissions(),
+            Some(path),
+        );
+        kms.provision_key().unwrap();
+
+        let result = kms.sign_payload("balances.transfer", "5G", 10, b"payload");
+
+        assert!(matches!(
+            result,
+            Err(KmsError::AuditLogPersistenceFailed(_))
+        ));
+        assert_eq!(kms.spent_today(), 0);
+        assert!(kms.get_audit_log().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persistent_audit_log_rejects_weak_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "lunes-mcp-audit-weak-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let kms = AgentKms::new_with_optional_audit_log_path(
+            AgentMode::Autonomous,
+            test_permissions(),
+            Some(path.clone()),
+        );
+        kms.provision_key().unwrap();
+
+        let result = kms.sign_payload("balances.transfer", "5G", 10, b"payload");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(
+            result,
+            Err(KmsError::AuditLogPersistenceFailed(_))
+        ));
+        assert!(kms.get_audit_log().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persistent_audit_log_rejects_symlink() {
+        let base = std::env::temp_dir().join(format!(
+            "lunes-mcp-audit-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = base.with_extension("target");
+        let link = base.with_extension("link");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let kms = AgentKms::new_with_optional_audit_log_path(
+            AgentMode::Autonomous,
+            test_permissions(),
+            Some(link.clone()),
+        );
+        kms.provision_key().unwrap();
+
+        let result = kms.sign_payload("balances.transfer", "5G", 10, b"payload");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+
+        assert!(matches!(
+            result,
+            Err(KmsError::AuditLogPersistenceFailed(_))
+        ));
+        assert!(kms.get_audit_log().is_empty());
+    }
+
+    #[test]
+    fn test_contract_call_requires_explicit_method_allowlist() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, test_permissions());
+
+        let result = kms.validate_contract_call("5G", "PSP22::balance_of");
+
+        assert!(matches!(
+            result,
+            Err(KmsError::UnauthorizedContractMessage { .. })
+        ));
+    }
+
+    #[test]
     fn test_spending_tracker_cleanup() {
         let mut tracker = SpendingTracker::new(100);
-        // Simulate spending from a previous day.
-        tracker.daily_totals.insert("2020-01-01".to_string(), 50);
+        tracker
+            .daily_totals
+            .insert(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(), 50);
         tracker
             .daily_totals
             .insert(SpendingTracker::current_day_key(), 30);
 
         tracker.cleanup_old_entries();
 
-        // The old day should be removed.
         assert_eq!(tracker.daily_totals.len(), 1);
         assert_eq!(tracker.spent_today(), 30);
     }

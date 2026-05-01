@@ -76,6 +76,21 @@ fn accepts_request_with_bearer_api_key() {
 }
 
 #[test]
+fn tools_list_exposes_block_history_tools() {
+    let server = RunningServer::start(Some("test-token"), 10, 20);
+
+    let response = post_json_rpc(
+        &server.addr,
+        Some("Bearer test-token"),
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains(r#""name":"lunes_get_recent_blocks""#));
+    assert!(response.contains(r#""name":"lunes_get_block_events""#));
+}
+
+#[test]
 fn rate_limit_rejects_requests_after_burst() {
     let server = RunningServer::start(Some("test-token"), 1, 1);
 

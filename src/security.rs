@@ -365,6 +365,38 @@ mod tests {
     }
 
     #[test]
+    fn auth_rejection_does_not_consume_authenticated_rate_limit() {
+        let state = TransportSecurityState::new(
+            Some("secret-token".into()),
+            RateLimitSettings {
+                per_second: 1,
+                burst: 1,
+            },
+        );
+        let headers = http::HeaderMap::new();
+
+        assert!(matches!(
+            state.check_request(&headers),
+            Err(SecurityRejection::Unauthorized)
+        ));
+        assert!(matches!(
+            state.check_request(&headers),
+            Err(SecurityRejection::Unauthorized)
+        ));
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            API_KEY_HEADER,
+            http::HeaderValue::from_static("secret-token"),
+        );
+        assert!(state.check_request(&headers).is_ok());
+        assert!(matches!(
+            state.check_request(&headers),
+            Err(SecurityRejection::RateLimited(_))
+        ));
+    }
+
+    #[test]
     fn token_bucket_allows_burst_then_blocks() {
         let limiter = TokenBucket::new(1, 2);
         let now = Instant::now();

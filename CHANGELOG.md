@@ -6,6 +6,21 @@
   staking account state, transaction status, and contract simulations.
 - Added asset inventory and allowlisted PSP22 balance dry-runs.
 - Added guarded relay for externally signed Lunes transaction payloads.
+- Hardened relay so signed extrinsic hashes must be pre-approved before
+  broadcast, with explicit `author.submit_extrinsic` -> `broadcast` agent
+  policy required.
+- Required explicit contract/message allowlists for PSP22 and generic contract
+  write preparation.
+- Added raw event storage to transaction status responses when available.
+- Added bounded recent block summaries, raw block event lookup, and account
+  activity timeline entries without returning raw extrinsics from block summary
+  responses.
+- Bounded in-memory audit logs and redacted RPC endpoint credentials in status
+  and connection errors.
+- Added optional JSONL audit persistence with payload hashes instead of raw
+  payload bytes.
+- Rejected unsafe RPC endpoint config such as public `ws://`, credentials, query
+  strings, and fragments.
 - Added staking preparation tools for bond, unbond, withdraw, nominate, chill,
   and reward destination updates.
 - Added production guardrails for public binds, API keys, rate limiting,

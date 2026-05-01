@@ -1,12 +1,8 @@
-/// Lunes MCP Server - agent configuration.
-///
-/// Loads the `agent_config.toml` file that controls agent mode,
-/// permission boundaries, and server transport settings.
+//! Agent configuration loading and runtime validation.
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
-
-// --- Typed enums ---------------------------------------------------------
 
 /// Agent operating mode.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -20,8 +16,6 @@ pub enum AgentMode {
 }
 
 pub const AUTONOMOUS_STUB_ENV_VAR: &str = "LUNES_MCP_ALLOW_AUTONOMOUS_STUB";
-
-// --- Configuration structs ----------------------------------------------
 
 /// Root TOML structure.
 #[derive(Debug, Deserialize)]
@@ -132,8 +126,6 @@ fn default_rate_burst() -> u32 {
     20
 }
 
-// --- Loader --------------------------------------------------------------
-
 /// Loads and parses the full configuration file.
 pub fn load_config(path: &str) -> Result<ConfigFile, ConfigError> {
     let path = Path::new(path);
@@ -184,6 +176,8 @@ pub fn validate_runtime_config(
     config: &ConfigFile,
     autonomous_stub_allowed: bool,
 ) -> Result<(), ConfigValidationError> {
+    validate_network_config(&config.network)?;
+
     if config.agent.wallet.mode != AgentMode::Autonomous {
         return Ok(());
     }
@@ -221,7 +215,91 @@ pub fn validate_runtime_config(
     Ok(())
 }
 
-// --- Errors --------------------------------------------------------------
+fn validate_network_config(network: &NetworkConfig) -> Result<(), ConfigValidationError> {
+    validate_rpc_endpoint("network.rpc_url", &network.rpc_url)?;
+    for endpoint in &network.rpc_failovers {
+        validate_rpc_endpoint("network.rpc_failovers", endpoint)?;
+    }
+    if let Some(endpoint) = &network.archive_url {
+        validate_rpc_endpoint("network.archive_url", endpoint)?;
+    }
+
+    Ok(())
+}
+
+fn validate_rpc_endpoint(field: &'static str, endpoint: &str) -> Result<(), ConfigValidationError> {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return Err(ConfigValidationError::UnsafeRpcEndpoint {
+            field,
+            endpoint: redact_config_endpoint(endpoint),
+            reason: "missing URL scheme".into(),
+        });
+    };
+
+    let (authority, _) = rest
+        .find(['/', '?', '#'])
+        .map(|idx| rest.split_at(idx))
+        .unwrap_or((rest, ""));
+    if authority.is_empty() {
+        return Err(ConfigValidationError::UnsafeRpcEndpoint {
+            field,
+            endpoint: redact_config_endpoint(endpoint),
+            reason: "missing URL host".into(),
+        });
+    }
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let is_local_ws = scheme == "ws"
+        && matches!(
+            host.split(':').next().unwrap_or(""),
+            "127.0.0.1" | "::1" | "localhost"
+        );
+
+    if scheme != "wss" && !is_local_ws {
+        return Err(ConfigValidationError::UnsafeRpcEndpoint {
+            field,
+            endpoint: redact_config_endpoint(endpoint),
+            reason: "RPC endpoints must use wss://, except local ws:// development endpoints"
+                .into(),
+        });
+    }
+
+    if authority.contains('@') || endpoint.contains('?') || endpoint.contains('#') {
+        return Err(ConfigValidationError::UnsafeRpcEndpoint {
+            field,
+            endpoint: redact_config_endpoint(endpoint),
+            reason: "RPC endpoints must not contain credentials, query strings, or fragments"
+                .into(),
+        });
+    }
+
+    Ok(())
+}
+
+fn redact_config_endpoint(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    let (authority, suffix) = rest
+        .find(['/', '?', '#'])
+        .map(|idx| rest.split_at(idx))
+        .unwrap_or((rest, ""));
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| format!("<redacted>@{host}"))
+        .unwrap_or_else(|| authority.to_string());
+    let suffix = suffix
+        .find(['?', '#'])
+        .map(|idx| {
+            let marker = suffix.as_bytes()[idx] as char;
+            format!("{}{}<redacted>", &suffix[..idx], marker)
+        })
+        .unwrap_or_else(|| suffix.to_string());
+
+    format!("{scheme}://{authority}{suffix}")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -254,9 +332,14 @@ pub enum ConfigValidationError {
 
     #[error("autonomous contracts.call is disabled until contract message allowlists and asset-specific limits exist")]
     ContractsCallDisabled,
-}
 
-// --- Tests ---------------------------------------------------------------
+    #[error("{field} contains unsafe RPC endpoint '{endpoint}': {reason}")]
+    UnsafeRpcEndpoint {
+        field: &'static str,
+        endpoint: String,
+        reason: String,
+    },
+}
 
 #[cfg(test)]
 mod tests {
@@ -303,7 +386,7 @@ daily_limit_lunes = 0
 "#;
         let file: ConfigFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.agent.wallet.mode, AgentMode::PrepareOnly);
-        assert_eq!(file.agent.permissions.ttl_hours, 168); // default
+        assert_eq!(file.agent.permissions.ttl_hours, 168);
     }
 
     #[test]
@@ -373,6 +456,64 @@ daily_limit_lunes = 0
         let cfg = autonomous_config(vec!["balances.transfer"], vec!["5GoodAddress"], 100, 168);
 
         assert_eq!(validate_runtime_config(&cfg, true), Ok(()));
+    }
+
+    #[test]
+    fn runtime_config_rejects_public_ws_rpc_endpoint() {
+        let mut cfg = autonomous_config(vec!["balances.transfer"], vec!["5GoodAddress"], 100, 168);
+        cfg.network.rpc_url = "ws://rpc.example".into();
+
+        let err = validate_runtime_config(&cfg, true).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConfigValidationError::UnsafeRpcEndpoint {
+                field: "network.rpc_url",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_config_allows_local_ws_rpc_endpoint() {
+        let mut cfg = autonomous_config(vec!["balances.transfer"], vec!["5GoodAddress"], 100, 168);
+        cfg.network.rpc_url = "ws://127.0.0.1:9944".into();
+
+        assert_eq!(validate_runtime_config(&cfg, true), Ok(()));
+    }
+
+    #[test]
+    fn runtime_config_rejects_rpc_credentials_and_query_strings() {
+        let mut cfg = autonomous_config(vec!["balances.transfer"], vec!["5GoodAddress"], 100, 168);
+        cfg.network.rpc_url = "wss://user:secret@rpc.example/ws?token=abc".into();
+
+        let err = validate_runtime_config(&cfg, true).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConfigValidationError::UnsafeRpcEndpoint {
+                field: "network.rpc_url",
+                ..
+            }
+        ));
+        assert!(!err.to_string().contains("secret"));
+        assert!(!err.to_string().contains("token=abc"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_rpc_endpoint_without_host() {
+        let mut cfg = autonomous_config(vec!["balances.transfer"], vec!["5GoodAddress"], 100, 168);
+        cfg.network.rpc_url = "wss://".into();
+
+        let err = validate_runtime_config(&cfg, true).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConfigValidationError::UnsafeRpcEndpoint {
+                field: "network.rpc_url",
+                ..
+            }
+        ));
     }
 
     fn autonomous_config(

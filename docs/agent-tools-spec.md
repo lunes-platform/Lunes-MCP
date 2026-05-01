@@ -1,7 +1,7 @@
 # Lunes Agent Tools Specification
 
-This document defines the public contract for the Lunes Network tools used by
-MCP-compatible agents.
+This document defines the public contract for MCP-compatible agents that inspect
+and prepare actions on the Lunes Blockchain.
 
 ## Objective
 
@@ -15,8 +15,10 @@ The server must keep the same safety boundary across all tools:
 - write tools can only prepare payloads or sign local intent payloads after
   policy checks;
 - externally signed transaction payloads can be submitted only when
-  `LUNES_MCP_ENABLE_BROADCAST=1` and the request includes
-  `confirm_broadcast=true`;
+  `LUNES_MCP_ENABLE_BROADCAST=1`, their computed signed extrinsic hash is
+  present in `LUNES_MCP_ALLOWED_BROADCAST_HASHES`, and the request includes
+  `confirm_broadcast=true`; agent policy must also allow
+  `author.submit_extrinsic` and whitelist `broadcast`;
 - final Lunes Network transaction construction and signing are not enabled in
   this release.
 
@@ -52,7 +54,9 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_get_validator_profiles` | Read | Read active-set status, commission, blocked state, and nomination eligibility for validators |
 | `lunes_get_staking_overview` | Read | Summarize validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_staking_account` | Read | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for one Lunes account |
-| `lunes_search_account_activity` | Read | Search pending transactions and recent finalized blocks for bounded account activity |
+| `lunes_get_recent_blocks` | Read | List recent finalized block summaries without returning raw extrinsics |
+| `lunes_get_block_events` | Read | Read raw event storage for a block by hash, number, or the finalized head |
+| `lunes_search_account_activity` | Read | Search pending transactions and recent finalized blocks for bounded account activity timelines |
 | `lunes_submit_signed_extrinsic` | Write | Relay an externally signed Lunes transaction payload, then poll for inclusion/finality |
 | `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
 
@@ -102,11 +106,19 @@ Always:
 - validate SS58 addresses before account-specific reads;
 - keep read-only tools free of signing or budget mutation;
 - require contract/message allowlists before PSP22 balance dry-runs;
+- require contract/message allowlists before contract write preparation;
 - cap user-controlled limits such as validator list size and archive lookup
   depth;
+- keep block history tools bounded and avoid returning raw extrinsics from block
+  summary responses;
 - keep write tools behind allowlists, TTL, and daily spend limits;
-- require both `LUNES_MCP_ENABLE_BROADCAST=1` and `confirm_broadcast=true`
-  before relaying an externally signed payload.
+- require `LUNES_MCP_ENABLE_BROADCAST=1`, `confirm_broadcast=true`, and a
+  pre-approved signed extrinsic hash before relaying an externally signed
+  payload;
+- require `author.submit_extrinsic` plus the `broadcast` policy target before
+  relaying an externally signed payload;
+- reject unsafe runtime RPC configuration, including public `ws://` endpoints,
+  userinfo credentials, query strings, and fragments.
 
 Ask first:
 
@@ -144,9 +156,16 @@ Never:
 - `lunes_get_staking_account` returns live staking state, including unlocking
   chunks, for bonded, nominator, validator, and idle accounts without signing
   or broadcasting.
-- `lunes_search_account_activity` caps account activity scans.
+- `lunes_get_recent_blocks` returns only block hash, number, and extrinsic count
+  for bounded recent finalized block windows.
+- `lunes_get_block_events` returns raw event storage for an explicitly selected
+  block or finalized head without pretending to decode events.
+- `lunes_search_account_activity` caps account activity scans and returns
+  pending/finalized timeline entries using an explicit raw account-id substring
+  match strategy.
 - `lunes_submit_signed_extrinsic` rejects calls without explicit confirmation
-  and broadcast opt-in, and returns hash, status, block details, and raw event
-  storage for accepted payloads when the network exposes them.
+  broadcast opt-in, and hash preapproval, and returns hash, status, block
+  details, and raw event storage for accepted payloads when the network exposes
+  them.
 - `lunes_read_contract` requires contract message allowlists before live reads.
 - All verification commands pass before publishing.

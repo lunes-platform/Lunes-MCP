@@ -14,28 +14,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::abi_registry::AbiRegistry;
-use crate::address::{validate_lunes_address, LUNES_SS58_PREFIX};
-use crate::kms::AgentKms;
+use crate::address::{validate_lunes_address, LunesAddress, LUNES_SS58_PREFIX};
+use crate::kms::{AgentKms, KmsError};
 use crate::lunes_client::{
-    LunesClient, LunesClientError, NativeBalance, DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS,
+    signed_extrinsic_payload_hash, LunesClient, LunesClientError, NativeBalance,
+    StakingRewardDestination, StakingRewardDestinationKind, DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS,
     MAX_ARCHIVE_TX_LOOKBACK_BLOCKS,
 };
 
 const LUNES_DECIMALS: u32 = 8;
 const LUNES_BASE_UNITS: u128 = 100_000_000;
 const STAKING_POLICY_DESTINATION: &str = "staking";
+const BROADCAST_POLICY_EXTRINSIC: &str = "author.submit_extrinsic";
+const BROADCAST_POLICY_DESTINATION: &str = "broadcast";
 const MAX_NOMINATIONS: usize = 16;
 const DEFAULT_VALIDATOR_LIMIT: usize = 16;
 const MAX_VALIDATOR_LIMIT: usize = 64;
 const BROADCAST_OPT_IN_ENV: &str = "LUNES_MCP_ENABLE_BROADCAST";
+const BROADCAST_HASH_ALLOWLIST_ENV: &str = "LUNES_MCP_ALLOWED_BROADCAST_HASHES";
 const DEFAULT_SUBMISSION_WAIT_BLOCKS: u64 = 4;
 const MAX_SUBMISSION_WAIT_BLOCKS: u64 = 16;
-
-// --- MCP-compatible response schemas ------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct ToolCallRequest {
     pub name: String,
+    /// Intentional JSON boundary: MCP tool arguments are validated by each handler
+    /// against that tool's schema.
     pub arguments: Value,
 }
 
@@ -56,12 +60,16 @@ pub struct McpToolResult {
 }
 
 impl McpToolResult {
-    /// Successful response with JSON data serialized as text content.
+    /// Successful response with tool-specific JSON data serialized as text content.
+    ///
+    /// `Value` is intentional at this MCP boundary because each tool returns a
+    /// different JSON object while the outer MCP result shape stays fixed.
     pub fn success(data: Value) -> Self {
         Self {
             content: vec![ContentBlock {
                 content_type: "text".into(),
-                text: serde_json::to_string_pretty(&data).unwrap_or_default(),
+                text: serde_json::to_string_pretty(&data)
+                    .expect("serde_json::Value serializes to JSON text"),
             }],
             is_error: false,
         }
@@ -76,13 +84,17 @@ impl McpToolResult {
         Self {
             content: vec![ContentBlock {
                 content_type: "text".into(),
-                text: serde_json::to_string_pretty(&error_data).unwrap_or_default(),
+                text: serde_json::to_string_pretty(&error_data)
+                    .expect("serde_json::Value serializes to JSON text"),
             }],
             is_error: true,
         }
     }
 
     /// Pending response for operations that need human approval.
+    ///
+    /// `data` remains open JSON because pending payloads intentionally mirror the
+    /// write action being prepared for external review.
     pub fn pending(data: Value) -> Self {
         let pending_data = serde_json::json!({
             "status": "pending_human_approval",
@@ -91,41 +103,18 @@ impl McpToolResult {
         Self {
             content: vec![ContentBlock {
                 content_type: "text".into(),
-                text: serde_json::to_string_pretty(&pending_data).unwrap_or_default(),
+                text: serde_json::to_string_pretty(&pending_data)
+                    .expect("serde_json::Value serializes to JSON text"),
             }],
             is_error: false,
         }
     }
 }
 
-// --- SS58 address validation --------------------------------------------
-
-/// Basic SS58 address validation for Lunes-compatible addresses.
-fn is_valid_ss58(address: &str) -> bool {
-    validate_lunes_address(address).is_ok()
-}
-
 /// Validates an SS58 address and maps failures to a tool error.
 fn validate_address(address: &str, field_name: &str) -> Result<(), McpToolResult> {
-    if address.is_empty() {
-        return Err(McpToolResult::error(
-            -32001,
-            format!("Missing required field: {}", field_name),
-        ));
-    }
-    if !is_valid_ss58(address) {
-        return Err(McpToolResult::error(
-            -32001,
-            format!(
-                "Invalid Lunes address for '{}': '{}'. Expected SS58 prefix {} with a valid checksum.",
-                field_name, address, LUNES_SS58_PREFIX
-            ),
-        ));
-    }
-    Ok(())
+    parse_lunes_address(address, field_name).map(|_| ())
 }
-
-// --- Dispatcher ----------------------------------------------------------
 
 /// Routes a tool call name to the matching handler.
 pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolResult {
@@ -139,6 +128,8 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         | "lunes_get_asset_balance"
         | "lunes_search_account_activity"
         | "lunes_get_transaction_status"
+        | "lunes_get_recent_blocks"
+        | "lunes_get_block_events"
         | "lunes_get_network_health"
         | "lunes_get_account_overview"
         | "lunes_get_investment_position"
@@ -204,8 +195,12 @@ pub async fn dispatch_tool_call_with_chain(
         "lunes_get_transaction_status" => {
             handle_get_tx_status(&request.arguments, lunes_client).await
         }
+        "lunes_get_recent_blocks" => {
+            handle_get_recent_blocks(&request.arguments, lunes_client).await
+        }
+        "lunes_get_block_events" => handle_get_block_events(&request.arguments, lunes_client).await,
         "lunes_submit_signed_extrinsic" => {
-            handle_submit_signed_extrinsic(&request.arguments, lunes_client).await
+            handle_submit_signed_extrinsic(&request.arguments, kms, lunes_client).await
         }
         "lunes_search_account_activity" => {
             handle_search_account_activity(&request.arguments, lunes_client).await
@@ -216,6 +211,9 @@ pub async fn dispatch_tool_call_with_chain(
 }
 
 /// MCP tool descriptors exposed by the server.
+///
+/// The descriptors are JSON Schema boundary documents, so `Value` is used here
+/// deliberately instead of modeling the full schema vocabulary in Rust.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         serde_json::json!({
@@ -361,12 +359,39 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "lunes_get_recent_blocks",
+            "description": "List recent finalized Lunes blocks with hash, number, and extrinsic count only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lookback_blocks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_ARCHIVE_TX_LOOKBACK_BLOCKS,
+                        "description": "Number of finalized blocks before the finalized head to include. Defaults to the bounded archive lookup window."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_block_events",
+            "description": "Read raw event storage for a finalized Lunes block by hash, number, or the current finalized head.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "block_hash": { "type": "string", "description": "Optional 32-byte block hash. Omit with block_number to use finalized head." },
+                    "block_number": { "type": "integer", "minimum": 0, "description": "Optional block number. Do not provide with block_hash." }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "lunes_submit_signed_extrinsic",
-            "description": "Broadcast a human-signed Lunes extrinsic and poll for inclusion/finality. Requires LUNES_MCP_ENABLE_BROADCAST=1 and confirm_broadcast=true.",
+            "description": "Broadcast a human-signed Lunes extrinsic and poll for inclusion/finality. Requires broadcast env opt-in, hash preapproval, confirm_broadcast=true, and agent policy author.submit_extrinsic -> broadcast.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "signed_extrinsic": { "type": "string", "description": "0x-prefixed signed extrinsic bytes produced by an external Lunes wallet." },
+                    "expected_tx_hash": { "type": "string", "description": "Optional expected hash for the signed extrinsic. When provided it must match the computed payload hash." },
                     "confirm_broadcast": { "type": "boolean", "description": "Must be true to broadcast." },
                     "wait_blocks": {
                         "type": "integer",
@@ -571,8 +596,6 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-// --- Generic write operation helper -------------------------------------
-
 /// Runs a write operation through the common policy and signing pipeline.
 fn execute_write_operation(
     kms: &AgentKms,
@@ -583,12 +606,10 @@ fn execute_write_operation(
     success_data: impl FnOnce(&str, &str) -> Value, // (signature, public_key) -> response data
     pending_data: Value,
 ) -> McpToolResult {
-    // Validate extrinsic, destination, and daily limit without consuming budget.
     if let Err(e) = kms.preflight_write(extrinsic, destination, amount_lunes) {
         return McpToolResult::error(e.error_code(), e.to_string());
     }
 
-    // Prepare-only mode returns a payload for external human review.
     if !kms.is_autonomous() {
         let mut final_pending = pending_data;
         if kms.permissions().human_approval_required {
@@ -604,16 +625,12 @@ fn execute_write_operation(
         return McpToolResult::pending(final_pending);
     }
 
-    // Autonomous mode signs through the KMS after all checks pass.
     match kms.sign_payload(extrinsic, destination, amount_lunes, payload.as_bytes()) {
         Ok(signed) => McpToolResult::success(success_data(&signed.signature, &signed.public_key)),
         Err(e) => McpToolResult::error(e.error_code(), e.to_string()),
     }
 }
 
-// --- Read-only handlers --------------------------------------------------
-
-/// `lunes_get_balance` - reads native or PSP22 balance information.
 async fn handle_get_balance(
     args: &Value,
     kms: &AgentKms,
@@ -628,10 +645,9 @@ fn handle_get_assets(kms: &AgentKms) -> McpToolResult {
         .allowlist_contracts
         .iter()
         .filter(|(_, methods)| {
-            methods.is_empty()
-                || methods
-                    .iter()
-                    .any(|method| is_psp22_balance_method(method.as_str()))
+            methods
+                .iter()
+                .any(|method| is_psp22_balance_method(method.as_str()))
         })
         .map(|(contract_address, methods)| {
             serde_json::json!({
@@ -825,7 +841,7 @@ async fn handle_get_investment_position(
         "agent_actions": {
             "can_prepare_staking_actions": can_prepare_writes && can_manage_staking,
             "can_sign_local_intents": kms.is_autonomous() && kms.is_active(),
-            "can_broadcast_to_lunes_network": false,
+            "can_broadcast_to_lunes_network": can_broadcast_to_lunes_network(kms),
             "available_staking_tools": staking_tools_allowed(kms),
         },
         "risk_notes": [
@@ -1043,7 +1059,7 @@ async fn handle_get_staking_account(
                 "agent_actions": {
                     "can_prepare_staking_actions": can_prepare_writes(kms) && can_manage_staking(kms),
                     "can_sign_local_intents": kms.is_autonomous() && kms.is_active(),
-                    "can_broadcast_to_lunes_network": false,
+                    "can_broadcast_to_lunes_network": can_broadcast_to_lunes_network(kms),
                     "available_staking_tools": staking_tools_allowed(kms),
                 },
                 "lookup": staking_account.lookup,
@@ -1053,7 +1069,6 @@ async fn handle_get_staking_account(
     }
 }
 
-/// `lunes_get_transaction_status` - reads transaction status by hash.
 async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
     let tx_hash = args.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("");
     let requested_archive_lookback_blocks =
@@ -1096,6 +1111,8 @@ async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpTo
             "block_hash": status.block_hash,
             "block_number": status.block_number,
             "extrinsic_index": status.extrinsic_index,
+            "events": status.events,
+            "events_lookup_error": status.events_lookup_error,
             "lookup_scope": status.lookup_scope,
             "archive_lookback_blocks": archive_lookback_blocks,
             "note": lookup_note
@@ -1107,7 +1124,73 @@ async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpTo
     }
 }
 
-async fn handle_submit_signed_extrinsic(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+async fn handle_get_recent_blocks(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let lookback_blocks = args
+        .get("lookback_blocks")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS);
+
+    if lookback_blocks > MAX_ARCHIVE_TX_LOOKBACK_BLOCKS {
+        return McpToolResult::error(
+            -32001,
+            format!(
+                "lookback_blocks must be <= {}",
+                MAX_ARCHIVE_TX_LOOKBACK_BLOCKS
+            ),
+        );
+    }
+
+    match lunes_client.recent_blocks(lookback_blocks).await {
+        Ok(recent_blocks) => {
+            let returned = recent_blocks.blocks.len();
+            McpToolResult::success(serde_json::json!({
+                "source": recent_blocks.source,
+                "finalized_head": recent_blocks.finalized_head,
+                "lookback_blocks": recent_blocks.lookback_blocks,
+                "returned": returned,
+                "blocks": recent_blocks.blocks,
+                "note": "Summaries only; raw extrinsics are not returned."
+            }))
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+async fn handle_get_block_events(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let block_hash = args
+        .get("block_hash")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let block_number = args.get("block_number").and_then(|value| value.as_u64());
+
+    if block_hash.is_some() && block_number.is_some() {
+        return McpToolResult::error(
+            -32001,
+            "Provide either block_hash or block_number, not both.".into(),
+        );
+    }
+
+    match lunes_client.block_events(block_hash, block_number).await {
+        Ok(block_events) => McpToolResult::success(serde_json::json!({
+            "source": block_events.source,
+            "block_hash": block_events.block_hash,
+            "block_number": block_events.block_number,
+            "events": block_events.events,
+            "decoded": false,
+            "note": "Event storage is returned raw. Decoding remains explicit future work."
+        })),
+        Err(LunesClientError::InvalidTransactionHash(message)) => {
+            McpToolResult::error(-32001, message)
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+async fn handle_submit_signed_extrinsic(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
     let signed_extrinsic = args
         .get("signed_extrinsic")
         .and_then(|v| v.as_str())
@@ -1142,6 +1225,21 @@ async fn handle_submit_signed_extrinsic(args: &Value, lunes_client: &LunesClient
             format!("wait_blocks must be <= {MAX_SUBMISSION_WAIT_BLOCKS}"),
         );
     }
+    let signed_extrinsic_hash = match validate_broadcast_preapproval(args, signed_extrinsic) {
+        Ok(hash) => hash,
+        Err(error) => return error,
+    };
+    if let Err(error) =
+        kms.preflight_write(BROADCAST_POLICY_EXTRINSIC, BROADCAST_POLICY_DESTINATION, 0)
+    {
+        return McpToolResult::error(
+            error.error_code(),
+            format!(
+                "Broadcast policy denied: {}. Allow '{}' and whitelist '{}' to relay externally signed Lunes extrinsics.",
+                error, BROADCAST_POLICY_EXTRINSIC, BROADCAST_POLICY_DESTINATION
+            ),
+        );
+    }
 
     match lunes_client
         .submit_signed_extrinsic(signed_extrinsic, wait_blocks)
@@ -1154,9 +1252,12 @@ async fn handle_submit_signed_extrinsic(args: &Value, lunes_client: &LunesClient
             "block_number": submission.block_number,
             "extrinsic_index": submission.extrinsic_index,
             "events": submission.events,
+            "events_lookup_error": submission.events_lookup_error,
+            "archive_lookup_error": submission.archive_lookup_error,
             "endpoint": submission.endpoint,
             "wait_blocks": submission.wait_blocks,
             "broadcasted": submission.broadcasted,
+            "signed_extrinsic_hash": signed_extrinsic_hash,
             "note": "This tool only broadcasts an already-signed extrinsic. It does not construct or sign final Lunes Network transactions."
         })),
         Err(LunesClientError::InvalidSignedExtrinsic(message)) => {
@@ -1206,7 +1307,64 @@ fn broadcast_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// `lunes_search_contract` - looks up Lunes contract metadata.
+fn validate_broadcast_preapproval(
+    args: &Value,
+    signed_extrinsic: &str,
+) -> Result<String, McpToolResult> {
+    let signed_extrinsic_hash = signed_extrinsic_payload_hash(signed_extrinsic)
+        .map_err(|error| McpToolResult::error(-32001, error.to_string()))?;
+
+    if let Some(expected_tx_hash) = args
+        .get("expected_tx_hash")
+        .and_then(|value| value.as_str())
+        .filter(|hash| !hash.is_empty())
+    {
+        if !expected_tx_hash.eq_ignore_ascii_case(&signed_extrinsic_hash) {
+            return Err(McpToolResult::error(
+                -32011,
+                format!(
+                    "expected_tx_hash does not match signed extrinsic hash {signed_extrinsic_hash}"
+                ),
+            ));
+        }
+    }
+
+    if !allowed_broadcast_hashes()
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&signed_extrinsic_hash))
+    {
+        return Err(McpToolResult::error(
+            -32011,
+            format!(
+                "signed extrinsic hash {signed_extrinsic_hash} must be pre-approved in {BROADCAST_HASH_ALLOWLIST_ENV}"
+            ),
+        ));
+    }
+
+    Ok(signed_extrinsic_hash)
+}
+
+fn allowed_broadcast_hashes() -> Vec<String> {
+    std::env::var(BROADCAST_HASH_ALLOWLIST_ENV)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn can_broadcast_to_lunes_network(kms: &AgentKms) -> bool {
+    broadcast_enabled()
+        && !allowed_broadcast_hashes().is_empty()
+        && kms
+            .preflight_write(BROADCAST_POLICY_EXTRINSIC, BROADCAST_POLICY_DESTINATION, 0)
+            .is_ok()
+}
+
 fn handle_search_contract(args: &Value) -> McpToolResult {
     let contract_address = args
         .get("contract_address")
@@ -1288,10 +1446,7 @@ fn handle_validate_address(args: &Value) -> McpToolResult {
     }
 }
 
-fn parse_lunes_address(
-    address: &str,
-    field_name: &str,
-) -> Result<crate::address::LunesAddress, McpToolResult> {
+fn parse_lunes_address(address: &str, field_name: &str) -> Result<LunesAddress, McpToolResult> {
     if address.is_empty() {
         return Err(McpToolResult::error(
             -32001,
@@ -1327,12 +1482,14 @@ fn is_psp22_balance_method(method: &str) -> bool {
     method == "PSP22::balance_of" || method == "balance_of"
 }
 
-fn validate_psp22_balance_read(
-    kms: &AgentKms,
-    contract_address: &str,
-) -> Result<(), crate::kms::KmsError> {
+fn validate_psp22_balance_read(kms: &AgentKms, contract_address: &str) -> Result<(), KmsError> {
     kms.validate_contract_call(contract_address, "PSP22::balance_of")
         .or_else(|_| kms.validate_contract_call(contract_address, "balance_of"))
+}
+
+fn validate_psp22_transfer(kms: &AgentKms, contract_address: &str) -> Result<(), KmsError> {
+    kms.validate_contract_call(contract_address, "PSP22::transfer")
+        .or_else(|_| kms.validate_contract_call(contract_address, "transfer"))
 }
 
 fn native_balance_json(balance: NativeBalance) -> Value {
@@ -1413,7 +1570,7 @@ fn agent_policy_json(kms: &AgentKms) -> Value {
         "can_prepare_writes": can_prepare_writes,
         "can_manage_staking": can_manage_staking,
         "can_sign_local_intents": kms.is_autonomous() && kms.is_active(),
-        "can_broadcast_to_lunes_network": false,
+        "can_broadcast_to_lunes_network": can_broadcast_to_lunes_network(kms),
         "allowed_extrinsics": permissions.allowed_extrinsics,
         "whitelisted_addresses": permissions.whitelisted_addresses,
         "daily_limit_lunes": permissions.daily_limit_lunes,
@@ -1455,7 +1612,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
         "summary": if is_autonomous {
             "Agent is in autonomous mode, but every write still requires allowlists, TTL, and spend limits."
         } else {
-            "Agent is in prepare-only mode. It can help prepare actions, but cannot sign or broadcast."
+            "Agent is in prepare-only mode. It can help prepare actions and relay pre-approved externally signed extrinsics when broadcast guardrails are enabled."
         },
         "mode": format!("{:?}", kms.mode()),
         "kms_active": kms.is_active(),
@@ -1465,7 +1622,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "can_prepare_writes": can_prepare_writes,
             "can_manage_staking": can_manage_staking,
             "can_sign_local_intents": is_autonomous && kms.is_active(),
-            "can_broadcast_to_lunes_network": false,
+            "can_broadcast_to_lunes_network": can_broadcast_to_lunes_network(kms),
         },
         "policy": {
             "allowed_extrinsics": permissions.allowed_extrinsics,
@@ -1480,16 +1637,13 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "empty extrinsic allowlist blocks all write tools",
             "empty destination whitelist blocks all write destinations",
             "staking tools require the staking policy target plus validator or reward accounts in the whitelist",
-            "generic contract calls are blocked in autonomous mode until message allowlists exist",
-            "broadcast to Lunes Network is not enabled in this release"
+            "contract calls require explicit contract and message allowlists",
+            "broadcast to Lunes Network requires local opt-in, caller confirmation, and a pre-approved signed extrinsic hash"
         ],
         "signing_status": signing_status,
     }))
 }
 
-// --- Write handlers ------------------------------------------------------
-
-/// `lunes_transfer_native` - prepares or signs a native LUNES transfer.
 fn handle_transfer_native(args: &Value, kms: &AgentKms) -> McpToolResult {
     let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
     let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1532,7 +1686,6 @@ fn handle_transfer_native(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_transfer_psp22` - prepares or signs a PSP22 token transfer.
 fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
     let contract = args
         .get("contract_address")
@@ -1549,6 +1702,10 @@ fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
     }
     if amount == 0 {
         return McpToolResult::error(-32001, "Missing or zero required field: amount".into());
+    }
+
+    if let Err(error) = validate_psp22_transfer(kms, contract) {
+        return McpToolResult::error(error.error_code(), error.to_string());
     }
 
     let payload = format!("contracts.call({contract},PSP22::transfer,{to},{amount})");
@@ -1584,7 +1741,6 @@ fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_call_contract` - prepares or signs a generic Lunes contract call.
 fn handle_call_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
     let contract = args
         .get("contract_address")
@@ -1598,6 +1754,9 @@ fn handle_call_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
     }
     if message.is_empty() {
         return McpToolResult::error(-32001, "Missing required field: message".into());
+    }
+    if let Err(error) = kms.validate_contract_call(contract, message) {
+        return McpToolResult::error(error.error_code(), error.to_string());
     }
 
     let call_args = args.get("args").cloned().unwrap_or(Value::Null);
@@ -1637,7 +1796,6 @@ fn handle_call_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_stake_bond` - prepares or signs a staking bond operation.
 fn handle_stake_bond(args: &Value, kms: &AgentKms) -> McpToolResult {
     let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
     if amount == 0 {
@@ -1667,7 +1825,6 @@ fn handle_stake_bond(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_stake_unbond` - prepares or signs staking unbond.
 fn handle_stake_unbond(args: &Value, kms: &AgentKms) -> McpToolResult {
     let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
     if amount == 0 {
@@ -1687,7 +1844,6 @@ fn handle_stake_unbond(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_stake_withdraw_unbonded` - prepares or signs unlocked fund withdrawal.
 fn handle_stake_withdraw_unbonded(args: &Value, kms: &AgentKms) -> McpToolResult {
     let slashing_spans = args
         .get("slashing_spans")
@@ -1707,7 +1863,6 @@ fn handle_stake_withdraw_unbonded(args: &Value, kms: &AgentKms) -> McpToolResult
     )
 }
 
-/// `lunes_stake_nominate` - prepares or signs validator nominations.
 fn handle_stake_nominate(args: &Value, kms: &AgentKms) -> McpToolResult {
     let validators = match string_array(args, "validators") {
         Ok(validators) => validators,
@@ -1746,7 +1901,6 @@ fn handle_stake_nominate(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_stake_chill` - prepares or signs nomination pause.
 fn handle_stake_chill(kms: &AgentKms) -> McpToolResult {
     execute_staking_operation(
         kms,
@@ -1759,7 +1913,6 @@ fn handle_stake_chill(kms: &AgentKms) -> McpToolResult {
     )
 }
 
-/// `lunes_stake_set_payee` - prepares or signs reward destination update.
 fn handle_stake_set_payee(args: &Value, kms: &AgentKms) -> McpToolResult {
     let reward = match reward_destination_from_args(args, false) {
         Ok(reward) => reward,
@@ -1834,50 +1987,36 @@ fn execute_staking_operation(
     )
 }
 
-#[derive(Debug)]
-struct RewardDestination {
-    destination: String,
-    account: Option<String>,
-}
-
-impl RewardDestination {
-    fn payload_value(&self) -> String {
-        match &self.account {
-            Some(account) => format!("{}:{account}", self.destination),
-            None => self.destination.clone(),
-        }
-    }
-}
-
 fn reward_destination_from_args(
     args: &Value,
     default_to_staked: bool,
-) -> Result<RewardDestination, McpToolResult> {
-    let destination = args
+) -> Result<StakingRewardDestination, McpToolResult> {
+    let destination_arg = args
         .get("reward_destination")
         .and_then(|v| v.as_str())
         .unwrap_or(if default_to_staked { "staked" } else { "" });
 
-    if destination.is_empty() {
+    if destination_arg.is_empty() {
         return Err(McpToolResult::error(
             -32001,
             "Missing required field: reward_destination".into(),
         ));
     }
 
-    if !matches!(destination, "staked" | "stash" | "controller" | "account") {
-        return Err(McpToolResult::error(
-            -32001,
-            "reward_destination must be staked, stash, controller, or account".into(),
-        ));
-    }
+    let destination =
+        StakingRewardDestinationKind::from_tool_arg(destination_arg).ok_or_else(|| {
+            McpToolResult::error(
+                -32001,
+                "reward_destination must be staked, stash, controller, or account".into(),
+            )
+        })?;
 
     let account = args
         .get("reward_account")
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    if destination == "account" {
+    if destination == StakingRewardDestinationKind::Account {
         let account = account.ok_or_else(|| {
             McpToolResult::error(
                 -32001,
@@ -1885,14 +2024,14 @@ fn reward_destination_from_args(
             )
         })?;
         validate_address(&account, "reward_account")?;
-        return Ok(RewardDestination {
-            destination: destination.into(),
+        return Ok(StakingRewardDestination {
+            destination,
             account: Some(account),
         });
     }
 
-    Ok(RewardDestination {
-        destination: destination.into(),
+    Ok(StakingRewardDestination {
+        destination,
         account: None,
     })
 }
@@ -1928,7 +2067,7 @@ fn optional_string_array(
 
 fn validate_reward_account_whitelist(
     kms: &AgentKms,
-    reward: &RewardDestination,
+    reward: &StakingRewardDestination,
 ) -> Option<McpToolResult> {
     reward.account.as_ref().and_then(|account| {
         validate_extra_whitelisted_destinations(kms, std::slice::from_ref(account))
@@ -1956,7 +2095,6 @@ fn validate_extra_whitelisted_destinations(
     None
 }
 
-/// `lunes_provision_agent_wallet` - creates a local agent key for approval.
 fn handle_provision_wallet(kms: &AgentKms) -> McpToolResult {
     match kms.provision_key() {
         Ok(pub_key) => McpToolResult::pending(serde_json::json!({
@@ -1968,7 +2106,6 @@ fn handle_provision_wallet(kms: &AgentKms) -> McpToolResult {
     }
 }
 
-/// `lunes_revoke_agent_wallet` - removes the current local agent key.
 fn handle_revoke_wallet(kms: &AgentKms) -> McpToolResult {
     kms.revoke_key();
 
@@ -1977,8 +2114,6 @@ fn handle_revoke_wallet(kms: &AgentKms) -> McpToolResult {
         "kms_active": false
     }))
 }
-
-// --- Contract Read Operations --------------------------------------------
 
 async fn handle_read_contract(args: &Value, kms: &AgentKms, client: &LunesClient) -> McpToolResult {
     let contract = args
@@ -2037,18 +2172,20 @@ async fn handle_read_contract(args: &Value, kms: &AgentKms, client: &LunesClient
     }
 }
 
-// --- Tests ---------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::address::encode_lunes_address_for_tests;
     use crate::config::{AgentMode, PermissionsConfig};
     use crate::lunes_client::{
-        ChainInfo, ChainProperties, NativeBalance, NetworkHealth, Nominations, RuntimeInfo,
-        StakingAccount, StakingLedger, StakingRewardDestination, TransactionState,
-        TransactionStatus, UnlockChunk, ValidatorPrefs, ValidatorProfile, ValidatorSet,
+        BlockEvents, BlockEventsLookup, BlockSummary, ChainInfo, ChainProperties, NativeBalance,
+        NetworkHealth, Nominations, RecentBlocks, RuntimeInfo, SignedExtrinsicSubmission,
+        StakingAccount, StakingLedger, StakingRewardDestination, StakingRewardDestinationKind,
+        StakingRole, TransactionState, TransactionStatus, UnlockChunk, ValidatorPrefs,
+        ValidatorProfile, ValidatorSet,
     };
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn lunes_address(seed: u8) -> String {
         encode_lunes_address_for_tests([seed; 32])
@@ -2085,6 +2222,78 @@ mod tests {
         }
     }
 
+    fn broadcast_permissions() -> PermissionsConfig {
+        PermissionsConfig {
+            allowed_extrinsics: vec![BROADCAST_POLICY_EXTRINSIC.into()],
+            whitelisted_addresses: vec![BROADCAST_POLICY_DESTINATION.into()],
+            daily_limit_lunes: 1,
+            allowlist_contracts: Default::default(),
+            ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
+        }
+    }
+
+    fn signed_submission() -> SignedExtrinsicSubmission {
+        SignedExtrinsicSubmission {
+            tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+            status: TransactionState::Finalized,
+            block_hash: Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222".into(),
+            ),
+            block_number: Some(42),
+            extrinsic_index: Some(0),
+            events: Some(BlockEvents {
+                block_hash: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .into(),
+                raw_storage: "0x00".into(),
+                decoded: false,
+            }),
+            events_lookup_error: None,
+            archive_lookup_error: None,
+            endpoint: "memory://lunes".into(),
+            wait_blocks: 0,
+            broadcasted: true,
+        }
+    }
+
+    fn recent_blocks_fixture() -> RecentBlocks {
+        RecentBlocks {
+            source: "static_test".into(),
+            finalized_head: BlockSummary {
+                hash: format!("0x{}", "aa".repeat(32)),
+                number: 42,
+                extrinsic_count: 3,
+            },
+            lookback_blocks: 1,
+            blocks: vec![
+                BlockSummary {
+                    hash: format!("0x{}", "aa".repeat(32)),
+                    number: 42,
+                    extrinsic_count: 3,
+                },
+                BlockSummary {
+                    hash: format!("0x{}", "bb".repeat(32)),
+                    number: 41,
+                    extrinsic_count: 1,
+                },
+            ],
+        }
+    }
+
+    fn block_events_fixture() -> BlockEventsLookup {
+        BlockEventsLookup {
+            source: "static_test".into(),
+            block_hash: format!("0x{}", "aa".repeat(32)),
+            block_number: Some(42),
+            events: Some(BlockEvents {
+                block_hash: format!("0x{}", "aa".repeat(32)),
+                raw_storage: "0x00".into(),
+                decoded: false,
+            }),
+        }
+    }
+
     fn response_json(response: &McpToolResult) -> serde_json::Value {
         serde_json::from_str(&response.content[0].text).expect("tool response text is JSON")
     }
@@ -2108,7 +2317,6 @@ mod tests {
         let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
         let client = LunesClient::static_native_balance(NativeBalance::zero());
 
-        // Empty address
         let response = dispatch_tool_call_with_chain(
             &ToolCallRequest {
                 name: "lunes_get_balance".into(),
@@ -2120,7 +2328,6 @@ mod tests {
         .await;
         assert!(response.is_error);
 
-        // Invalid SS58 (too short)
         let response = dispatch_tool_call_with_chain(
             &ToolCallRequest {
                 name: "lunes_get_balance".into(),
@@ -2182,7 +2389,7 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.content[0].text.contains("-32011"));
-        assert!(response.content[0].text.contains("whitelist"));
+        assert!(response.content[0].text.contains("allowlisted"));
     }
 
     #[test]
@@ -2421,7 +2628,7 @@ mod tests {
             stash_address: stash.clone(),
             controller_address: Some(controller.clone()),
             bonded: true,
-            roles: vec!["bonded".into(), "validator".into()],
+            roles: vec![StakingRole::Bonded, StakingRole::Validator],
             ledger: Some(StakingLedger {
                 stash_account_id: [8u8; 32],
                 stash_address: stash.clone(),
@@ -2436,7 +2643,7 @@ mod tests {
                 raw_extra_bytes: 0,
             }),
             reward_destination: Some(StakingRewardDestination {
-                destination: "staked".into(),
+                destination: StakingRewardDestinationKind::Staked,
                 account: None,
             }),
             nominations: Some(Nominations {
@@ -2484,6 +2691,12 @@ mod tests {
             block_hash: Some(format!("0x{}", "22".repeat(32))),
             block_number: Some(42),
             extrinsic_index: Some(3),
+            events: Some(BlockEvents {
+                block_hash: format!("0x{}", "22".repeat(32)),
+                raw_storage: "0x00".into(),
+                decoded: false,
+            }),
+            events_lookup_error: None,
             lookup_scope: "test scope".into(),
         });
 
@@ -2502,6 +2715,7 @@ mod tests {
         assert_eq!(data["status"], "finalized");
         assert_eq!(data["block_number"], 42);
         assert_eq!(data["extrinsic_index"], 3);
+        assert_eq!(data["events"]["raw_storage"], "0x00");
         assert_eq!(
             data["archive_lookback_blocks"],
             DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS
@@ -2517,6 +2731,8 @@ mod tests {
             block_hash: None,
             block_number: None,
             extrinsic_index: None,
+            events: None,
+            events_lookup_error: None,
             lookup_scope: "test scope".into(),
         });
 
@@ -2543,6 +2759,8 @@ mod tests {
             block_hash: None,
             block_number: None,
             extrinsic_index: None,
+            events: None,
+            events_lookup_error: None,
             lookup_scope: "test scope".into(),
         });
 
@@ -2561,6 +2779,118 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.content[0].text.contains("archive_lookback_blocks"));
+    }
+
+    #[tokio::test]
+    async fn get_recent_blocks_returns_static_summaries() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_recent_blocks(recent_blocks_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_recent_blocks".into(),
+                arguments: serde_json::json!({ "lookback_blocks": 1 }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["source"], "static_test");
+        assert_eq!(data["finalized_head"]["number"], 42);
+        assert_eq!(data["returned"], 2);
+        assert_eq!(data["blocks"][0]["extrinsic_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn get_recent_blocks_rejects_lookback_above_limit() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_recent_blocks(recent_blocks_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_recent_blocks".into(),
+                arguments: serde_json::json!({
+                    "lookback_blocks": MAX_ARCHIVE_TX_LOOKBACK_BLOCKS + 1,
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("lookback_blocks"));
+    }
+
+    #[tokio::test]
+    async fn get_block_events_returns_static_raw_events() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_block_events(block_events_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_block_events".into(),
+                arguments: serde_json::json!({
+                    "block_hash": format!("0x{}", "aa".repeat(32)),
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["source"], "static_test");
+        assert_eq!(data["block_number"], 42);
+        assert_eq!(data["events"]["raw_storage"], "0x00");
+        assert_eq!(data["events"]["decoded"], false);
+    }
+
+    #[tokio::test]
+    async fn get_block_events_rejects_ambiguous_reference() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_block_events(block_events_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_block_events".into(),
+                arguments: serde_json::json!({
+                    "block_hash": format!("0x{}", "aa".repeat(32)),
+                    "block_number": 42,
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0]
+            .text
+            .contains("block_hash or block_number"));
+    }
+
+    #[tokio::test]
+    async fn get_block_events_rejects_invalid_hash() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_block_events(block_events_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_block_events".into(),
+                arguments: serde_json::json!({ "block_hash": "0x1234" }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("expected 32 bytes"));
     }
 
     #[tokio::test]
@@ -2583,6 +2913,96 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.content[0].text.contains("confirm_broadcast"));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_extrinsic_requires_preapproved_hash() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var(BROADCAST_OPT_IN_ENV, "1");
+        std::env::remove_var(BROADCAST_HASH_ALLOWLIST_ENV);
+
+        let hash = signed_extrinsic_payload_hash("0x01020304").unwrap();
+        let response =
+            validate_broadcast_preapproval(&serde_json::json!({}), "0x01020304").unwrap_err();
+
+        std::env::remove_var(BROADCAST_OPT_IN_ENV);
+        std::env::remove_var(BROADCAST_HASH_ALLOWLIST_ENV);
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains(&hash));
+        assert!(response.content[0]
+            .text
+            .contains(BROADCAST_HASH_ALLOWLIST_ENV));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_extrinsic_requires_agent_broadcast_policy() {
+        let _guard = ENV_LOCK.lock().await;
+        let hash = signed_extrinsic_payload_hash("0x01020304").unwrap();
+        std::env::set_var(BROADCAST_OPT_IN_ENV, "1");
+        std::env::set_var(BROADCAST_HASH_ALLOWLIST_ENV, hash.clone());
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_submission(signed_submission());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_submit_signed_extrinsic".into(),
+                arguments: serde_json::json!({
+                    "signed_extrinsic": "0x01020304",
+                    "expected_tx_hash": hash,
+                    "confirm_broadcast": true,
+                    "wait_blocks": 0
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        std::env::remove_var(BROADCAST_OPT_IN_ENV);
+        std::env::remove_var(BROADCAST_HASH_ALLOWLIST_ENV);
+
+        assert!(response.is_error);
+        assert!(response.content[0]
+            .text
+            .contains(BROADCAST_POLICY_EXTRINSIC));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_extrinsic_allows_preapproved_human_signed_payload() {
+        let _guard = ENV_LOCK.lock().await;
+        let hash = signed_extrinsic_payload_hash("0x01020304").unwrap();
+        std::env::set_var(BROADCAST_OPT_IN_ENV, "1");
+        std::env::set_var(BROADCAST_HASH_ALLOWLIST_ENV, hash.clone());
+        let kms = AgentKms::new(AgentMode::PrepareOnly, broadcast_permissions());
+        let client = LunesClient::static_submission(signed_submission());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_submit_signed_extrinsic".into(),
+                arguments: serde_json::json!({
+                    "signed_extrinsic": "0x01020304",
+                    "expected_tx_hash": hash,
+                    "confirm_broadcast": true,
+                    "wait_blocks": 0
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        std::env::remove_var(BROADCAST_OPT_IN_ENV);
+        std::env::remove_var(BROADCAST_HASH_ALLOWLIST_ENV);
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(
+            data["tx_hash"],
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(data["signed_extrinsic_hash"], hash);
+        assert_eq!(data["broadcasted"], true);
     }
 
     #[tokio::test]
@@ -2686,7 +3106,7 @@ mod tests {
         .await;
 
         assert!(response.is_error);
-        assert!(response.content[0].text.contains("not in the whitelist"));
+        assert!(response.content[0].text.contains("allowlisted"));
     }
 
     #[tokio::test]
@@ -2775,13 +3195,15 @@ mod tests {
     fn psp22_transfer_consumes_daily_budget() {
         let contract = lunes_address(2);
         let to = lunes_address(3);
+        let mut allowlist_contracts = std::collections::HashMap::new();
+        allowlist_contracts.insert(contract.clone(), vec!["PSP22::transfer".into()]);
         let kms = AgentKms::new(
             AgentMode::Autonomous,
             PermissionsConfig {
                 allowed_extrinsics: vec!["contracts.call".into()],
                 whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 5,
-                allowlist_contracts: Default::default(),
+                allowlist_contracts,
                 ttl_hours: 168,
                 human_approval_required: true,
                 approval_message_template: None,
@@ -2803,6 +3225,71 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.content[0].text.contains("-32010"));
+    }
+
+    #[test]
+    fn psp22_transfer_requires_contract_message_allowlist() {
+        let contract = lunes_address(2);
+        let to = lunes_address(3);
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["contracts.call".into()],
+                whitelisted_addresses: vec![contract.clone()],
+                daily_limit_lunes: 100,
+                allowlist_contracts: Default::default(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_transfer_psp22".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                    "to": to,
+                    "amount": 10
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("transfer"));
+    }
+
+    #[test]
+    fn generic_contract_call_requires_message_allowlist() {
+        let contract = lunes_address(2);
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["contracts.call".into()],
+                whitelisted_addresses: vec![contract.clone()],
+                daily_limit_lunes: 100,
+                allowlist_contracts: Default::default(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_call_contract".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                    "message": "PSP22::approve",
+                    "value": 0
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("PSP22::approve"));
     }
 
     #[test]
@@ -2846,7 +3333,7 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 31);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_assets"));
         assert!(tools
@@ -2892,6 +3379,12 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_search_account_activity"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_recent_blocks"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_block_events"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_read_contract"));
@@ -3032,11 +3525,10 @@ mod tests {
 
     #[test]
     fn ss58_validation_works() {
-        assert!(is_valid_ss58(&lunes_address(4)));
-        // Too short
-        assert!(!is_valid_ss58("5Gxyz"));
-        assert!(!is_valid_ss58(
-            "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-        ));
+        assert!(validate_lunes_address(&lunes_address(4)).is_ok());
+        assert!(validate_lunes_address("5Gxyz").is_err());
+        assert!(
+            validate_lunes_address("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").is_err()
+        );
     }
 }

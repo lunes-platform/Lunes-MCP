@@ -5,7 +5,9 @@
 # safe: it can prepare payloads for review, but it cannot sign or spend.
 
 [network]
-# Primary Lunes Network WebSocket endpoint.
+# Primary Lunes Network WebSocket endpoint. Runtime validation accepts wss://
+# endpoints, plus ws://127.0.0.1 or ws://localhost for local development.
+# Credentials, query strings, and URL fragments are rejected.
 rpc_url = "wss://ws.lunes.io"
 
 # Fallback WebSocket endpoints.
@@ -30,10 +32,12 @@ mode = "prepare_only"
 [agent.permissions]
 # Extrinsics the agent may invoke. Empty means no write operation is allowed.
 # Examples: "balances.transfer", "staking.bond", "staking.nominate".
+# Externally signed relay requires "author.submit_extrinsic".
 allowed_extrinsics = []
 
 # Destination addresses, contracts, or policy targets the agent may write to.
 # Staking workflows require "staking" plus every validator/reward address.
+# Externally signed relay requires the "broadcast" policy target.
 # Empty means no write destination is allowed.
 whitelisted_addresses = []
 
@@ -41,7 +45,8 @@ whitelisted_addresses = []
 # Zero blocks autonomous spend and native transfer preparation.
 daily_limit_lunes = 0
 
-# Read-only contract simulations require an explicit message allowlist.
+# Contract reads and write preparation require an explicit message allowlist.
+# Empty method lists do not grant wildcard access.
 # Example: { "6contract..." = ["PSP22::balance_of"] }
 allowlist_contracts = {}
 

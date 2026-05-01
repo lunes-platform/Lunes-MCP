@@ -23,11 +23,7 @@ registries = []
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
-skip = [
-  { crate = "toml_datetime@0.6.11", reason = "toml and jsonrpsee currently use different toml parser stacks" },
-  { crate = "toml_edit@0.22.27", reason = "toml and jsonrpsee currently use different toml parser stacks" },
-  { crate = "winnow@0.7.15", reason = "toml and jsonrpsee currently use different parser versions" },
-]
+skip = []
 
 [sources]
 unknown-registry = "deny"
