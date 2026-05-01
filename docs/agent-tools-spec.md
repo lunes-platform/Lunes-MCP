@@ -12,15 +12,22 @@ receiving unrestricted wallet authority.
 The server must keep the same safety boundary across all tools:
 
 - read tools can query live Lunes Network RPC;
-- write tools can only prepare payloads or sign local intent payloads after
-  policy checks;
+- write tools can prepare payloads or sign local intent payloads after policy
+  checks;
+- `lunes_transfer_native` can also build, KMS-sign, submit, and track a final
+  native transfer when `confirm_broadcast=true`,
+  `LUNES_MCP_ENABLE_BROADCAST=1`, `LUNES_MCP_ENABLE_INTERNAL_SIGNING=1`,
+  `LUNES_MCP_AUDIT_LOG_PATH`, transfer policy, broadcast policy, active KMS,
+  TTL, whitelist, and spend limits all pass;
 - externally signed transaction payloads can be submitted only when
   `LUNES_MCP_ENABLE_BROADCAST=1`, their computed signed extrinsic hash is
   present in `LUNES_MCP_ALLOWED_BROADCAST_HASHES`, and the request includes
   `confirm_broadcast=true`; agent policy must also allow
   `author.submit_extrinsic` and whitelist `broadcast`;
-- final Lunes Network transaction construction and signing are not enabled in
+- other KMS-built final Lunes Network transaction categories are not enabled in
   this release.
+- governance tools are limited to live raw reads and prepare-only payloads for
+  human review; they reject broadcast requests and never call the local KMS.
 
 ## Commands
 
@@ -54,10 +61,15 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_get_validator_profiles` | Read | Read active-set status, commission, blocked state, and nomination eligibility for validators |
 | `lunes_get_staking_overview` | Read | Summarize validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_staking_account` | Read | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for one Lunes account |
+| `lunes_get_governance_overview` | Read | Summarize raw referendum storage visibility and prepare-only governance policy |
+| `lunes_get_referenda` | Read | Read bounded raw referendum storage entries from live governance state |
 | `lunes_get_recent_blocks` | Read | List recent finalized block summaries without returning raw extrinsics |
 | `lunes_get_block_events` | Read | Read raw event storage for a block by hash, number, or the finalized head |
 | `lunes_search_account_activity` | Read | Search pending transactions and recent finalized blocks for bounded account activity timelines |
 | `lunes_submit_signed_extrinsic` | Write | Relay an externally signed Lunes transaction payload, then poll for inclusion/finality |
+| `lunes_transfer_native` | Write | Prepare, locally sign, or guarded-broadcast a native LUNES transfer |
+| `lunes_prepare_governance_vote` | Prepare | Prepare a human-review governance vote payload without signing or broadcasting |
+| `lunes_prepare_governance_remove_vote` | Prepare | Prepare a human-review remove-vote payload without signing or broadcasting |
 | `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
 
 ## Project Structure
@@ -112,11 +124,17 @@ Always:
 - keep block history tools bounded and avoid returning raw extrinsics from block
   summary responses;
 - keep write tools behind allowlists, TTL, and daily spend limits;
+- keep governance tools behind dedicated prepare-only policy fields and reject
+  `confirm_broadcast=true`;
+- never sign governance payloads with the local KMS, even in autonomous mode;
 - require `LUNES_MCP_ENABLE_BROADCAST=1`, `confirm_broadcast=true`, and a
   pre-approved signed extrinsic hash before relaying an externally signed
   payload;
 - require `author.submit_extrinsic` plus the `broadcast` policy target before
   relaying an externally signed payload;
+- require `LUNES_MCP_ENABLE_INTERNAL_SIGNING=1`, persistent audit logging, and
+  both transfer and broadcast policy before internally signing and broadcasting
+  a native transfer;
 - reject unsafe runtime RPC configuration, including public `ws://` endpoints,
   userinfo credentials, query strings, and fragments.
 
@@ -124,7 +142,8 @@ Ask first:
 
 - adding dependencies;
 - changing public tool names or response fields;
-- enabling internal final Lunes Network transaction construction or signing;
+- enabling additional internal final Lunes Network transaction categories such
+  as staking, PSP22, contracts, or governance;
 - expanding staking reads into reward payout history, performance scoring, or
   automated validator selection.
 
@@ -132,8 +151,8 @@ Never:
 
 - commit private keys, API keys, mnemonics, or production configs;
 - broadcast transactions from read-only tools;
-- construct or sign final network transactions from the local KMS until an
-  audited transaction builder exists;
+- construct or sign final network transactions from the local KMS outside the
+  audited native transfer path;
 - let an agent pick validators outside the configured whitelist for write
   operations.
 
@@ -156,6 +175,13 @@ Never:
 - `lunes_get_staking_account` returns live staking state, including unlocking
   chunks, for bonded, nominator, validator, and idle accounts without signing
   or broadcasting.
+- `lunes_get_governance_overview` reports raw referendum visibility and makes
+  the prepare-only governance policy explicit.
+- `lunes_get_referenda` returns bounded raw referendum storage without
+  pretending to decode referendum metadata.
+- `lunes_prepare_governance_vote` and
+  `lunes_prepare_governance_remove_vote` return pending human approval payloads
+  with `broadcasted=false`, no transaction hash, and no local KMS signature.
 - `lunes_get_recent_blocks` returns only block hash, number, and extrinsic count
   for bounded recent finalized block windows.
 - `lunes_get_block_events` returns raw event storage for an explicitly selected
@@ -167,5 +193,7 @@ Never:
   broadcast opt-in, and hash preapproval, and returns hash, status, block
   details, and raw event storage for accepted payloads when the network exposes
   them.
+- `lunes_transfer_native` preserves prepare/local-intent responses by default
+  and only broadcasts when every internal-signing guardrail passes.
 - `lunes_read_contract` requires contract message allowlists before live reads.
 - All verification commands pass before publishing.

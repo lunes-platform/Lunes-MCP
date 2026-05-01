@@ -6,6 +6,10 @@
   staking account state, transaction status, and contract simulations.
 - Added asset inventory and allowlisted PSP22 balance dry-runs.
 - Added guarded relay for externally signed Lunes transaction payloads.
+- Added guarded native LUNES transfer submission with dynamic transaction
+  construction, KMS Ed25519 signing, finality tracking, raw event lookup, dual
+  broadcast env gates, transfer/broadcast policy checks, and mandatory
+  persistent audit logging.
 - Hardened relay so signed extrinsic hashes must be pre-approved before
   broadcast, with explicit `author.submit_extrinsic` -> `broadcast` agent
   policy required.
@@ -23,6 +27,12 @@
   strings, and fragments.
 - Added staking preparation tools for bond, unbond, withdraw, nominate, chill,
   and reward destination updates.
+- Added governance read/preparation tools for bounded raw referendum storage,
+  explicit prepare-only vote policy, and human-review vote/remove-vote payloads
+  that never sign or broadcast.
+- Blocked autonomous high-risk governance and indirection extrinsics such as
+  referendum voting, batching, proxy, multisig, scheduler, and preimage calls
+  until dedicated safe policies exist.
 - Added production guardrails for public binds, API keys, rate limiting,
   request limits, and graceful shutdown.
 - Added Docker packaging and release-build CI coverage.

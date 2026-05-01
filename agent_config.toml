@@ -24,9 +24,8 @@ archive_url = "wss://ws-archive.lunes.io"
 #   "prepare_only" - prepare unsigned payloads for external review.
 #   "autonomous"   - sign locally after KMS policy checks.
 #
-# Autonomous mode is for local stub testing only until final Lunes Network
-# transaction construction and signing are implemented. It also requires:
-#   LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1
+# Autonomous mode requires explicit opt-in:
+#   LUNES_MCP_ALLOW_AUTONOMOUS=1
 mode = "prepare_only"
 
 [agent.permissions]
@@ -52,6 +51,15 @@ allowlist_contracts = {}
 
 # Agent key lifetime in hours. Zero disables expiration.
 ttl_hours = 168
+
+[agent.permissions.governance]
+# Governance is prepare-only. These fields only allow human-review payloads;
+# final votes must be signed in an external wallet.
+allow_prepare_votes = false
+allowed_referenda = []
+allowed_vote_directions = []
+allowed_convictions = []
+max_vote_lunes = 0
 
 [server]
 # Keep localhost by default. For containers, use 0.0.0.0 only with

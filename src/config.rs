@@ -15,6 +15,7 @@ pub enum AgentMode {
     PrepareOnly,
 }
 
+pub const AUTONOMOUS_MODE_ENV_VAR: &str = "LUNES_MCP_ALLOW_AUTONOMOUS";
 pub const AUTONOMOUS_STUB_ENV_VAR: &str = "LUNES_MCP_ALLOW_AUTONOMOUS_STUB";
 
 /// Root TOML structure.
@@ -73,6 +74,10 @@ pub struct PermissionsConfig {
     #[serde(default)]
     pub allowlist_contracts: HashMap<String, Vec<String>>,
 
+    /// Explicit prepare-only governance policy. Defaults deny every vote.
+    #[serde(default)]
+    pub governance: GovernancePolicyConfig,
+
     /// Agent key lifetime in hours. Zero disables expiration.
     #[serde(default = "default_ttl_hours")]
     pub ttl_hours: u64,
@@ -83,6 +88,30 @@ pub struct PermissionsConfig {
 
     /// Custom template for human approval pending message.
     pub approval_message_template: Option<String>,
+}
+
+/// Prepare-only governance policy. This never authorizes final voting broadcast.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct GovernancePolicyConfig {
+    /// Allows MCP tools to prepare human-review governance payloads.
+    #[serde(default)]
+    pub allow_prepare_votes: bool,
+
+    /// Referendum indexes the agent may prepare payloads for.
+    #[serde(default)]
+    pub allowed_referenda: Vec<u32>,
+
+    /// Allowed vote directions, for example `aye` and/or `nay`.
+    #[serde(default)]
+    pub allowed_vote_directions: Vec<String>,
+
+    /// Allowed conviction values, for example `none`, `locked1x`, `locked2x`.
+    #[serde(default)]
+    pub allowed_convictions: Vec<String>,
+
+    /// Maximum LUNES lock amount for a prepared vote. Zero denies vote payloads.
+    #[serde(default)]
+    pub max_vote_lunes: u64,
 }
 
 fn default_ttl_hours() -> u64 {
@@ -162,6 +191,7 @@ pub fn default_safe_config() -> ConfigFile {
                 whitelisted_addresses: vec![],
                 daily_limit_lunes: 0,
                 allowlist_contracts: HashMap::new(),
+                governance: GovernancePolicyConfig::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
                 approval_message_template: None,
@@ -212,7 +242,29 @@ pub fn validate_runtime_config(
         return Err(ConfigValidationError::ContractsCallDisabled);
     }
 
+    if let Some(extrinsic) = permissions
+        .allowed_extrinsics
+        .iter()
+        .find(|extrinsic| is_autonomous_high_risk_extrinsic(extrinsic))
+    {
+        return Err(ConfigValidationError::HighRiskAutonomousExtrinsicDisabled(
+            extrinsic.clone(),
+        ));
+    }
+
     Ok(())
+}
+
+fn is_autonomous_high_risk_extrinsic(extrinsic: &str) -> bool {
+    let normalized = extrinsic.to_ascii_lowercase().replace('_', "");
+    normalized.starts_with("referenda.")
+        || normalized.starts_with("democracy.")
+        || normalized.starts_with("convictionvoting.")
+        || normalized.starts_with("utility.")
+        || normalized.starts_with("proxy.")
+        || normalized.starts_with("multisig.")
+        || normalized.starts_with("scheduler.")
+        || normalized.starts_with("preimage.")
 }
 
 fn validate_network_config(network: &NetworkConfig) -> Result<(), ConfigValidationError> {
@@ -315,7 +367,7 @@ pub enum ConfigError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigValidationError {
-    #[error("autonomous mode is disabled until real Lunes Network transaction signing is implemented; set {AUTONOMOUS_STUB_ENV_VAR}=1 only for local testing")]
+    #[error("autonomous mode is disabled unless {AUTONOMOUS_MODE_ENV_VAR}=1 is set explicitly")]
     StubNotAllowed,
 
     #[error("autonomous mode requires at least one allowed extrinsic")]
@@ -332,6 +384,9 @@ pub enum ConfigValidationError {
 
     #[error("autonomous contracts.call is disabled until contract message allowlists and asset-specific limits exist")]
     ContractsCallDisabled,
+
+    #[error("autonomous extrinsic '{0}' is disabled until a dedicated safe policy exists")]
+    HighRiskAutonomousExtrinsicDisabled(String),
 
     #[error("{field} contains unsafe RPC endpoint '{endpoint}': {reason}")]
     UnsafeRpcEndpoint {
@@ -369,6 +424,7 @@ ttl_hours = 48
         assert_eq!(file.agent.permissions.ttl_hours, 48);
         assert_eq!(file.agent.permissions.whitelisted_addresses.len(), 1);
         assert!(file.agent.permissions.allowlist_contracts.is_empty());
+        assert!(!file.agent.permissions.governance.allow_prepare_votes);
     }
 
     #[test]
@@ -449,6 +505,29 @@ daily_limit_lunes = 0
         let err = validate_runtime_config(&cfg, true).unwrap_err();
 
         assert!(matches!(err, ConfigValidationError::ContractsCallDisabled));
+    }
+
+    #[test]
+    fn autonomous_mode_rejects_high_risk_governance_and_indirection_extrinsics() {
+        for extrinsic in [
+            "conviction_voting.vote",
+            "referenda.submit",
+            "democracy.vote",
+            "utility.batch",
+            "proxy.proxy",
+            "multisig.as_multi",
+            "scheduler.schedule",
+            "preimage.note_preimage",
+        ] {
+            let cfg = autonomous_config(vec![extrinsic], vec!["5GoodAddress"], 100, 168);
+
+            let err = validate_runtime_config(&cfg, true).unwrap_err();
+
+            assert!(matches!(
+                err,
+                ConfigValidationError::HighRiskAutonomousExtrinsicDisabled(_)
+            ));
+        }
     }
 
     #[test]
@@ -543,6 +622,7 @@ daily_limit_lunes = 0
                         .collect(),
                     daily_limit_lunes,
                     allowlist_contracts: HashMap::new(),
+                    governance: GovernancePolicyConfig::default(),
                     ttl_hours,
                     human_approval_required: true,
                     approval_message_template: None,

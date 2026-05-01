@@ -2,7 +2,7 @@
 name = "lunes-mcp-server"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.88"
 description = "Secure agent gateway for Lunes Network tooling"
 publish = false
 
@@ -25,3 +25,4 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 blake2 = "0.10"
 bs58 = "0.5"
+subxt = { version = "0.50.1", default-features = false, features = ["jsonrpsee", "native"] }

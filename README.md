@@ -1,7 +1,7 @@
 # Lunes MCP Server
 
 [![CI](https://github.com/lunes-platform/Lunes-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/lunes-platform/Lunes-MCP/actions/workflows/ci.yml)
-![Rust](https://img.shields.io/badge/Rust-1.86%2B-b7410e)
+![Rust](https://img.shields.io/badge/Rust-1.88%2B-b7410e)
 ![Transport](https://img.shields.io/badge/MCP-HTTP-2f6fed)
 ![Status](https://img.shields.io/badge/status-early%20access-f5a623)
 
@@ -23,9 +23,9 @@ binding, prepare-only mode, API-key protection for public binds, rate limiting,
 and policy checks before any local signing path is reached.
 
 The current release is ready for local evaluation, agent integration, and
-operator review. It does not construct or sign final Lunes Network transactions
-internally; it can relay an externally signed transaction payload only when the
-operator explicitly enables broadcasting.
+operator review. It can relay externally signed transaction payloads and can
+build, KMS-sign, submit, and track native LUNES transfers only when the operator
+enables every broadcast guardrail explicitly.
 
 ## Contents
 
@@ -51,7 +51,7 @@ operator explicitly enables broadcasting.
 | Authentication | `Authorization: Bearer <token>` or `x-lunes-mcp-api-key: <token>` |
 | Guardrails | allowed extrinsics, destination whitelist, TTL, daily spend limit |
 | Runtime checks | request size limit, response size limit, connection cap, rate limiting |
-| Network status | live metadata, health, native balances, validator set, archive-assisted transaction lookup, and guarded relay of externally signed payloads |
+| Network status | live metadata, health, native balances, validator set, archive-assisted transaction lookup, guarded relay of externally signed payloads, and guarded native LUNES transfer submission |
 
 ### Safety Model
 
@@ -61,8 +61,10 @@ The server is built to fail closed.
 - Empty extrinsic allowlists block all write tools.
 - Empty destination whitelists block all write destinations.
 - Staking tools require the `staking` policy target in the whitelist; validator and reward-account addresses must also be whitelisted.
-- Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1`.
+- Governance tools are read/prepare-only: they can read bounded referendum storage and prepare human-review vote payloads, but they never sign or broadcast final votes.
+- Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS=1`.
 - Broadcasting a human-signed extrinsic requires `LUNES_MCP_ENABLE_BROADCAST=1`, a pre-approved signed payload hash, `confirm_broadcast=true`, and agent policy allowing `author.submit_extrinsic` to the `broadcast` target.
+- Broadcasting an internally signed native LUNES transfer additionally requires `LUNES_MCP_ENABLE_INTERNAL_SIGNING=1`, `LUNES_MCP_AUDIT_LOG_PATH`, an active KMS key, `balances.transfer` policy for the recipient, and `author.submit_extrinsic` policy for `broadcast`.
 - Read-only contract simulation requires message-level allowlists; autonomous contract writes remain disabled until asset-specific limits are available.
 
 ## Agent Capabilities
@@ -79,11 +81,14 @@ action passes through explicit server-side policy.
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
 | Transaction awareness | Check pending pool, current heads, recent finalized block summaries, raw block events, and account activity timelines |
 | Human-signed transaction submission | Broadcast an externally signed Lunes extrinsic and poll for inclusion/finality when explicitly enabled |
+| Native transfer submission | Build, KMS-sign, broadcast, and track a native LUNES transfer when all internal-signing guardrails pass |
 | Validator visibility | Read the current validator set and expose bounded samples to agents |
 | Validator profiles | Inspect active-set status, commission, blocked state, and nomination eligibility hints |
 | Staking account state | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for a Lunes account |
 | Investment planning | Summarize liquid and reserved/locked LUNES for conservative staking or treasury planning |
 | Staking management | Prepare bond, unbond, withdraw, nominate, chill, and reward-destination updates |
+| Governance visibility | Read bounded raw referendum storage and current prepare-only governance policy |
+| Governance preparation | Prepare human-review vote and remove-vote payloads without MCP signing or broadcast |
 | Contract discovery | Look up Lunes contract interface metadata through the tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
@@ -173,6 +178,13 @@ daily_limit_lunes = 0
 allowlist_contracts = {}
 ttl_hours = 168
 
+[agent.permissions.governance]
+allow_prepare_votes = false
+allowed_referenda = []
+allowed_vote_directions = []
+allowed_convictions = []
+max_vote_lunes = 0
+
 [server]
 bind_address = "127.0.0.1"
 port = 9950
@@ -202,6 +214,19 @@ daily_limit_lunes = 100
 ttl_hours = 168
 ```
 
+For governance workflows, use the dedicated prepare-only policy. This policy
+does not authorize final votes; it only lets the MCP server build an explicit
+payload for human review in an external wallet:
+
+```toml
+[agent.permissions.governance]
+allow_prepare_votes = true
+allowed_referenda = [12]
+allowed_vote_directions = ["aye"]
+allowed_convictions = ["locked1x"]
+max_vote_lunes = 50
+```
+
 For a protected remote or container deployment:
 
 ```bash
@@ -220,12 +245,11 @@ x-lunes-mcp-api-key: <token>
 Autonomous signing is intentionally gated:
 
 ```bash
-export LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1
+export LUNES_MCP_ALLOW_AUTONOMOUS=1
 ```
 
-Use that flag only for local stub testing. Production autonomous execution needs
-real Lunes Network transaction construction, signing, submission, and finality
-tracking.
+The legacy `LUNES_MCP_ALLOW_AUTONOMOUS_STUB=1` variable is still accepted for
+older local setups, but new deployments should use `LUNES_MCP_ALLOW_AUTONOMOUS`.
 
 Broadcasting an extrinsic already signed by an external wallet is separately
 gated:
@@ -241,6 +265,21 @@ signed payload hash and requires it to be pre-approved in
 `author.submit_extrinsic` in `allowed_extrinsics` and `broadcast` in
 `whitelisted_addresses`. The relay still does not decode or verify the contents
 of a raw signed payload before submitting it.
+
+Internally signed native LUNES transfer broadcast is narrower and has an extra
+gate:
+
+```bash
+export LUNES_MCP_ENABLE_BROADCAST=1
+export LUNES_MCP_ENABLE_INTERNAL_SIGNING=1
+export LUNES_MCP_AUDIT_LOG_PATH="/var/log/lunes-mcp/audit.jsonl"
+```
+
+The request must include `confirm_broadcast=true`. Agent policy must allow
+`balances.transfer` to the recipient address and `author.submit_extrinsic` to
+the synthetic `broadcast` target. The response returns transaction hash,
+final status, block details, raw event storage when available, and `final_error`
+when the transaction finalizes with a runtime dispatch failure.
 
 Optional persistent audit logging can be enabled with:
 
@@ -431,6 +470,8 @@ use a client with HTTP MCP transport support.
 | `lunes_get_staking_overview` | Read | Summarizes validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_validator_profiles` | Read | Reads validator active-set status, commission, blocked state, and nomination eligibility |
 | `lunes_get_staking_account` | Read | Reads live staking state for one account, including bond, ledger, unlocking schedule, rewards destination, nominations, and validator preferences when present |
+| `lunes_get_governance_overview` | Read | Summarizes raw referendum visibility and prepare-only governance policy |
+| `lunes_get_referenda` | Read | Reads bounded raw referendum storage entries from live Lunes governance state |
 | `lunes_get_chain_info` | Read | Reads live Lunes Network metadata, token settings, address format, and runtime version |
 | `lunes_validate_address` | Read | Validates that an address uses the Lunes Network SS58 format |
 | `lunes_get_permissions` | Read | Summarizes the active agent mode, guardrails, and allowed write scope |
@@ -441,7 +482,7 @@ use a client with HTTP MCP transport support.
 | `lunes_search_account_activity` | Read | Searches pending transactions and recent finalized blocks for bounded account activity, including timeline entries |
 | `lunes_read_contract` | Read | Simulates a read-only Lunes contract call through live RPC when allowed by contract message policy |
 | `lunes_search_contract` | Read | Looks up Lunes contract interface metadata |
-| `lunes_transfer_native` | Write | Prepares or signs a native LUNES transfer |
+| `lunes_transfer_native` | Write | Prepares, locally signs, or guarded-broadcasts a native LUNES transfer |
 | `lunes_transfer_psp22` | Write | Prepares or signs a PSP22 transfer |
 | `lunes_call_contract` | Write | Prepares or signs a Lunes contract call |
 | `lunes_stake_bond` | Write | Prepares or signs a staking bond operation |
@@ -450,14 +491,20 @@ use a client with HTTP MCP transport support.
 | `lunes_stake_nominate` | Write | Prepares or signs validator nominations |
 | `lunes_stake_chill` | Write | Prepares or signs a pause of active nominations |
 | `lunes_stake_set_payee` | Write | Prepares or signs staking reward destination updates |
+| `lunes_prepare_governance_vote` | Prepare | Builds a human-review governance vote payload without signing or broadcasting |
+| `lunes_prepare_governance_remove_vote` | Prepare | Builds a human-review remove-vote payload without signing or broadcasting |
 | `lunes_provision_agent_wallet` | Lifecycle | Creates a local agent key for approval |
 | `lunes_revoke_agent_wallet` | Lifecycle | Revokes the current local agent key |
 
 Write tools are checked against policy before signing. Local intent-signing
-responses still include `broadcasted: false`; `lunes_submit_signed_extrinsic`
-is the separate relay path for payloads that were already signed outside this
-server. Contract write tools require explicit contract/message allowlists; an
-empty method list does not grant wildcard contract access.
+responses still include `broadcasted: false`. Native LUNES transfer is the only
+KMS-built final transaction path currently enabled, and only with the internal
+signing guardrails above. `lunes_submit_signed_extrinsic` remains the relay path
+for payloads that were already signed outside this server. Contract write tools
+require explicit contract/message allowlists; an empty method list does not
+grant wildcard contract access. Governance prepare tools are stricter: they
+never sign in autonomous mode, reject `confirm_broadcast=true`, and require the
+dedicated governance policy fields before returning a pending approval payload.
 
 ## Specifications
 
@@ -520,7 +567,7 @@ Key points:
 
 - Keep `LUNES_MCP_API_KEY` out of source control.
 - Do not expose the server publicly without authentication and TLS termination.
-- Treat autonomous signing as experimental until final transaction construction and signing are fully implemented.
+- Treat autonomous signing as experimental and enable internal native transfer broadcast only in operator-controlled environments.
 - Review `agent_config.toml` carefully before enabling any write tool.
 - Pre-approve only exact signed extrinsic hashes for relay, and rotate the
   allowlist after use.

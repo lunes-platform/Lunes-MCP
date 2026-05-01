@@ -17,7 +17,8 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::config::{
-    default_safe_config, load_config, validate_runtime_config, AgentMode, AUTONOMOUS_STUB_ENV_VAR,
+    default_safe_config, load_config, validate_runtime_config, AgentMode, AUTONOMOUS_MODE_ENV_VAR,
+    AUTONOMOUS_STUB_ENV_VAR,
 };
 use crate::kms::{AgentKms, AuditAction};
 use crate::lunes_client::{redact_rpc_endpoint, LunesClient};
@@ -93,10 +94,13 @@ async fn main() -> anyhow::Result<()> {
     let display_archive_url = archive_url
         .as_ref()
         .map(|endpoint| redact_rpc_endpoint(endpoint));
-    let autonomous_stub_allowed = std::env::var(AUTONOMOUS_STUB_ENV_VAR)
+    let autonomous_mode_allowed = std::env::var(AUTONOMOUS_MODE_ENV_VAR)
         .map(|value| value == "1")
-        .unwrap_or(false);
-    validate_runtime_config(&config_file, autonomous_stub_allowed)?;
+        .unwrap_or(false)
+        || std::env::var(AUTONOMOUS_STUB_ENV_VAR)
+            .map(|value| value == "1")
+            .unwrap_or(false);
+    validate_runtime_config(&config_file, autonomous_mode_allowed)?;
     info!(
         rpc_url = %display_rpc_url,
         mode = ?config_file.agent.wallet.mode,

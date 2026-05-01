@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::abi_registry::AbiRegistry;
 use crate::address::{validate_lunes_address, LunesAddress, LUNES_SS58_PREFIX};
-use crate::kms::{AgentKms, KmsError};
+use crate::kms::{AgentKms, KmsError, AUDIT_LOG_PATH_ENV};
 use crate::lunes_client::{
     signed_extrinsic_payload_hash, LunesClient, LunesClientError, NativeBalance,
     StakingRewardDestination, StakingRewardDestinationKind, DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS,
@@ -30,7 +30,10 @@ const BROADCAST_POLICY_DESTINATION: &str = "broadcast";
 const MAX_NOMINATIONS: usize = 16;
 const DEFAULT_VALIDATOR_LIMIT: usize = 16;
 const MAX_VALIDATOR_LIMIT: usize = 64;
+const DEFAULT_GOVERNANCE_REFERENDA_LIMIT: usize = 16;
+const MAX_GOVERNANCE_REFERENDA_LIMIT: usize = 64;
 const BROADCAST_OPT_IN_ENV: &str = "LUNES_MCP_ENABLE_BROADCAST";
+const INTERNAL_SIGNING_OPT_IN_ENV: &str = "LUNES_MCP_ENABLE_INTERNAL_SIGNING";
 const BROADCAST_HASH_ALLOWLIST_ENV: &str = "LUNES_MCP_ALLOWED_BROADCAST_HASHES";
 const DEFAULT_SUBMISSION_WAIT_BLOCKS: u64 = 4;
 const MAX_SUBMISSION_WAIT_BLOCKS: u64 = 16;
@@ -137,6 +140,8 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         | "lunes_get_validator_profiles"
         | "lunes_get_staking_overview"
         | "lunes_get_staking_account"
+        | "lunes_get_governance_overview"
+        | "lunes_get_referenda"
         | "lunes_submit_signed_extrinsic"
         | "lunes_read_contract" => {
             McpToolResult::error(-32020, "Tool requires a live Lunes RPC client".into())
@@ -152,6 +157,10 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_stake_nominate" => handle_stake_nominate(&request.arguments, kms),
         "lunes_stake_chill" => handle_stake_chill(kms),
         "lunes_stake_set_payee" => handle_stake_set_payee(&request.arguments, kms),
+        "lunes_prepare_governance_vote" => handle_prepare_governance_vote(&request.arguments, kms),
+        "lunes_prepare_governance_remove_vote" => {
+            handle_prepare_governance_remove_vote(&request.arguments, kms)
+        }
 
         // Agent wallet lifecycle
         "lunes_provision_agent_wallet" => handle_provision_wallet(kms),
@@ -192,6 +201,10 @@ pub async fn dispatch_tool_call_with_chain(
         "lunes_get_staking_account" => {
             handle_get_staking_account(&request.arguments, kms, lunes_client).await
         }
+        "lunes_get_governance_overview" => {
+            handle_get_governance_overview(&request.arguments, kms, lunes_client).await
+        }
+        "lunes_get_referenda" => handle_get_referenda(&request.arguments, lunes_client).await,
         "lunes_get_transaction_status" => {
             handle_get_tx_status(&request.arguments, lunes_client).await
         }
@@ -206,6 +219,9 @@ pub async fn dispatch_tool_call_with_chain(
             handle_search_account_activity(&request.arguments, lunes_client).await
         }
         "lunes_read_contract" => handle_read_contract(&request.arguments, kms, lunes_client).await,
+        "lunes_transfer_native" => {
+            handle_transfer_native_with_chain(&request.arguments, kms, lunes_client).await
+        }
         _ => dispatch_tool_call(request, kms),
     }
 }
@@ -342,6 +358,36 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "lunes_get_governance_overview",
+            "description": "Summarize live Lunes governance visibility and the prepare-only vote policy configured for this agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_GOVERNANCE_REFERENDA_LIMIT,
+                        "description": "Maximum referendum storage entries to sample. Defaults to 16."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_referenda",
+            "description": "Read bounded raw referendum storage entries from live Lunes governance state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_GOVERNANCE_REFERENDA_LIMIT,
+                        "description": "Maximum referendum storage entries to return. Defaults to 16."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "lunes_get_transaction_status",
             "description": "Read transaction status and events by hash.",
             "inputSchema": {
@@ -469,14 +515,23 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "lunes_transfer_native",
-            "description": "Prepare or sign a native LUNES transfer.",
+            "description": "Prepare, locally sign, or guarded-broadcast a native LUNES transfer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "to": { "type": "string", "description": "Recipient SS58 address." },
-                    "amount": { "type": "integer", "minimum": 1, "description": "LUNES amount." }
+                    "amount": { "type": "integer", "minimum": 1, "description": "Whole LUNES amount." },
+                    "amount_base_units": { "type": "string", "description": "Exact base-unit amount. Must match amount when both are provided." },
+                    "keep_alive": { "type": "boolean", "description": "Use Balances.transfer_keep_alive instead of transfer_allow_death." },
+                    "confirm_broadcast": { "type": "boolean", "description": "Must be true to broadcast a final transaction." },
+                    "wait_blocks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_SUBMISSION_WAIT_BLOCKS,
+                        "description": "Finalization wait budget. Defaults to 4."
+                    }
                 },
-                "required": ["to", "amount"]
+                "required": ["to"]
             }
         }),
         serde_json::json!({
@@ -575,6 +630,34 @@ pub fn tool_definitions() -> Vec<Value> {
                     "reward_account": { "type": "string", "description": "Required when reward_destination is account." }
                 },
                 "required": ["reward_destination"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_prepare_governance_vote",
+            "description": "Prepare a human-review governance vote payload without signing or broadcasting.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "referendum_index": { "type": "integer", "minimum": 0, "description": "Referendum index allowed by governance policy." },
+                    "vote": { "type": "string", "enum": ["aye", "nay"], "description": "Vote direction." },
+                    "conviction": { "type": "string", "description": "Conviction lock, for example none, locked1x, locked2x, locked3x, locked4x, locked5x, locked6x." },
+                    "amount": { "type": "integer", "minimum": 1, "description": "Whole LUNES lock amount." },
+                    "amount_base_units": { "type": "string", "description": "Exact base-unit lock amount. Must match amount when both are provided." },
+                    "confirm_broadcast": { "type": "boolean", "description": "Rejected when true; governance tools never broadcast." }
+                },
+                "required": ["referendum_index", "vote", "conviction"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_prepare_governance_remove_vote",
+            "description": "Prepare a human-review governance remove-vote payload without signing or broadcasting.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "referendum_index": { "type": "integer", "minimum": 0, "description": "Referendum index allowed by governance policy." },
+                    "confirm_broadcast": { "type": "boolean", "description": "Rejected when true; governance tools never broadcast." }
+                },
+                "required": ["referendum_index"]
             }
         }),
         serde_json::json!({
@@ -1069,6 +1152,65 @@ async fn handle_get_staking_account(
     }
 }
 
+async fn handle_get_governance_overview(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    let limit = match governance_limit_arg(args, "limit") {
+        Ok(limit) => limit,
+        Err(error) => return error,
+    };
+
+    match lunes_client.governance_referenda(limit).await {
+        Ok(referenda) => McpToolResult::success(serde_json::json!({
+            "lookup": referenda.source,
+            "network": "Lunes",
+            "governance_storage": {
+                "pallet": referenda.pallet,
+                "storage_item": referenda.storage_item,
+                "returned": referenda.returned,
+                "limit": referenda.limit,
+                "decoded": false,
+            },
+            "agent_policy": governance_policy_json(kms),
+            "agent_actions": {
+                "can_prepare_governance_actions": can_prepare_governance_actions(kms),
+                "can_sign_governance_transactions": false,
+                "can_broadcast_governance_transactions": false,
+            },
+            "write_status": "prepare_only",
+            "risk_notes": [
+                "Governance tools never sign or broadcast final votes.",
+                "Raw referendum storage is exposed for transparency; full decoded governance metadata requires runtime-specific decoding.",
+                "Any final vote must be reviewed and signed in an external human-controlled wallet."
+            ],
+        })),
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+async fn handle_get_referenda(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let limit = match governance_limit_arg(args, "limit") {
+        Ok(limit) => limit,
+        Err(error) => return error,
+    };
+
+    match lunes_client.governance_referenda(limit).await {
+        Ok(referenda) => McpToolResult::success(serde_json::json!({
+            "source": referenda.source,
+            "pallet": referenda.pallet,
+            "storage_item": referenda.storage_item,
+            "returned": referenda.returned,
+            "limit": referenda.limit,
+            "decoded": false,
+            "referenda": referenda.referenda,
+            "note": "Referendum storage is returned raw. Decoding remains explicit future work."
+        })),
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
 async fn handle_get_tx_status(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
     let tx_hash = args.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("");
     let requested_archive_lookback_blocks =
@@ -1257,6 +1399,7 @@ async fn handle_submit_signed_extrinsic(
             "endpoint": submission.endpoint,
             "wait_blocks": submission.wait_blocks,
             "broadcasted": submission.broadcasted,
+            "final_error": submission.final_error,
             "signed_extrinsic_hash": signed_extrinsic_hash,
             "note": "This tool only broadcasts an already-signed extrinsic. It does not construct or sign final Lunes Network transactions."
         })),
@@ -1303,6 +1446,12 @@ async fn handle_search_account_activity(args: &Value, lunes_client: &LunesClient
 
 fn broadcast_enabled() -> bool {
     std::env::var(BROADCAST_OPT_IN_ENV)
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn internal_signing_enabled() -> bool {
+    std::env::var(INTERNAL_SIGNING_OPT_IN_ENV)
         .map(|value| value == "1")
         .unwrap_or(false)
 }
@@ -1546,6 +1695,15 @@ fn can_manage_staking(kms: &AgentKms) -> bool {
         .any(|extrinsic| extrinsic.starts_with("staking."))
 }
 
+fn can_prepare_governance_actions(kms: &AgentKms) -> bool {
+    let policy = &kms.permissions().governance;
+    policy.allow_prepare_votes
+        && !policy.allowed_referenda.is_empty()
+        && !policy.allowed_vote_directions.is_empty()
+        && !policy.allowed_convictions.is_empty()
+        && policy.max_vote_lunes > 0
+}
+
 fn staking_tools_allowed(kms: &AgentKms) -> Vec<String> {
     kms.permissions()
         .allowed_extrinsics
@@ -1577,6 +1735,21 @@ fn agent_policy_json(kms: &AgentKms) -> Value {
         "spent_today_lunes": kms.spent_today(),
         "remaining_today_lunes": permissions.daily_limit_lunes.saturating_sub(kms.spent_today()),
         "ttl_hours": permissions.ttl_hours,
+        "governance": governance_policy_json(kms),
+    })
+}
+
+fn governance_policy_json(kms: &AgentKms) -> Value {
+    let policy = &kms.permissions().governance;
+    serde_json::json!({
+        "allow_prepare_votes": policy.allow_prepare_votes,
+        "allowed_referenda": policy.allowed_referenda,
+        "allowed_vote_directions": policy.allowed_vote_directions,
+        "allowed_convictions": policy.allowed_convictions,
+        "max_vote_lunes": policy.max_vote_lunes,
+        "can_prepare_governance_actions": can_prepare_governance_actions(kms),
+        "final_vote_signing": "external_wallet_only",
+        "mcp_broadcast": false,
     })
 }
 
@@ -1590,6 +1763,22 @@ fn validator_limit_arg(args: &Value, field_name: &str) -> Result<usize, McpToolR
         return Err(McpToolResult::error(
             -32001,
             format!("{field_name} must be between 1 and {MAX_VALIDATOR_LIMIT}"),
+        ));
+    }
+
+    Ok(limit as usize)
+}
+
+fn governance_limit_arg(args: &Value, field_name: &str) -> Result<usize, McpToolResult> {
+    let limit = args
+        .get(field_name)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DEFAULT_GOVERNANCE_REFERENDA_LIMIT as u64);
+
+    if limit == 0 || limit > MAX_GOVERNANCE_REFERENDA_LIMIT as u64 {
+        return Err(McpToolResult::error(
+            -32001,
+            format!("{field_name} must be between 1 and {MAX_GOVERNANCE_REFERENDA_LIMIT}"),
         ));
     }
 
@@ -1621,6 +1810,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "can_validate_lunes_addresses": true,
             "can_prepare_writes": can_prepare_writes,
             "can_manage_staking": can_manage_staking,
+            "can_prepare_governance_actions": can_prepare_governance_actions(kms),
             "can_sign_local_intents": is_autonomous && kms.is_active(),
             "can_broadcast_to_lunes_network": can_broadcast_to_lunes_network(kms),
         },
@@ -1631,6 +1821,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "spent_today_lunes": kms.spent_today(),
             "remaining_today_lunes": permissions.daily_limit_lunes.saturating_sub(kms.spent_today()),
             "ttl_hours": permissions.ttl_hours,
+            "governance": governance_policy_json(kms),
         },
         "guardrails": [
             "public HTTP bind requires API key and rate limit",
@@ -1638,6 +1829,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "empty destination whitelist blocks all write destinations",
             "staking tools require the staking policy target plus validator or reward accounts in the whitelist",
             "contract calls require explicit contract and message allowlists",
+            "governance tools are read/prepare-only and never sign or broadcast final votes",
             "broadcast to Lunes Network requires local opt-in, caller confirmation, and a pre-approved signed extrinsic hash"
         ],
         "signing_status": signing_status,
@@ -1646,28 +1838,30 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
 
 fn handle_transfer_native(args: &Value, kms: &AgentKms) -> McpToolResult {
     let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
-    let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    let amount = match native_transfer_amount_from_args(args) {
+        Ok(amount) => amount,
+        Err(error) => return error,
+    };
 
     if let Err(e) = validate_address(to, "to") {
         return e;
     }
-    if amount == 0 {
-        return McpToolResult::error(-32001, "Missing or zero required field: amount".into());
-    }
 
-    let payload = format!("balances.transfer({to},{amount})");
+    let payload = format!("balances.transfer({to},{})", amount.amount_base_units);
 
     execute_write_operation(
         kms,
         "balances.transfer",
         to,
-        amount,
+        amount.amount_lunes,
         &payload,
         |sig, pk| {
             serde_json::json!({
                 "action": "balances.transfer",
                 "to": to,
-                "amount_lunes": amount,
+                "amount_lunes": amount.amount_lunes,
+                "amount_exact_lunes": amount.exact_lunes,
+                "amount_base_units": amount.amount_base_units.to_string(),
                 "signature": sig,
                 "signer": pk,
                 "broadcasted": false,
@@ -1678,12 +1872,242 @@ fn handle_transfer_native(args: &Value, kms: &AgentKms) -> McpToolResult {
         serde_json::json!({
             "action": "balances.transfer",
             "to": to,
-            "amount_lunes": amount,
+            "amount_lunes": amount.amount_lunes,
+            "amount_exact_lunes": amount.exact_lunes,
+            "amount_base_units": amount.amount_base_units.to_string(),
             "unsigned_payload": payload,
             "broadcasted": false,
             "next_step": "Human must review and sign this transfer with an external wallet."
         }),
     )
+}
+
+async fn handle_transfer_native_with_chain(
+    args: &Value,
+    kms: &AgentKms,
+    lunes_client: &LunesClient,
+) -> McpToolResult {
+    let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+    let confirm_broadcast = args
+        .get("confirm_broadcast")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    if !confirm_broadcast {
+        return handle_transfer_native(args, kms);
+    }
+
+    let parsed_to = match parse_lunes_address(to, "to") {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+    let amount = match native_transfer_amount_from_args(args) {
+        Ok(amount) => amount,
+        Err(error) => return error,
+    };
+    let wait_blocks = args
+        .get("wait_blocks")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DEFAULT_SUBMISSION_WAIT_BLOCKS);
+    if wait_blocks > MAX_SUBMISSION_WAIT_BLOCKS {
+        return McpToolResult::error(
+            -32001,
+            format!("wait_blocks must be <= {MAX_SUBMISSION_WAIT_BLOCKS}"),
+        );
+    }
+
+    if let Err(error) = kms.preflight_write("balances.transfer", to, amount.amount_lunes) {
+        return McpToolResult::error(error.error_code(), error.to_string());
+    }
+    if !kms.is_autonomous() {
+        return McpToolResult::error(
+            KmsError::NotAutonomous.error_code(),
+            KmsError::NotAutonomous.to_string(),
+        );
+    }
+    if !broadcast_enabled() {
+        return McpToolResult::error(
+            -32011,
+            format!("{BROADCAST_OPT_IN_ENV}=1 is required before broadcasting to Lunes Network"),
+        );
+    }
+    if !internal_signing_enabled() {
+        return McpToolResult::error(
+            -32011,
+            format!(
+                "{INTERNAL_SIGNING_OPT_IN_ENV}=1 is required before the MCP server signs final Lunes transactions"
+            ),
+        );
+    }
+    if !kms.persistent_audit_log_enabled() {
+        return McpToolResult::error(
+            -32011,
+            format!(
+                "{AUDIT_LOG_PATH_ENV} must point to a writable JSONL file before internally signed Lunes transactions can be broadcast"
+            ),
+        );
+    }
+    if let Err(error) =
+        kms.preflight_write(BROADCAST_POLICY_EXTRINSIC, BROADCAST_POLICY_DESTINATION, 0)
+    {
+        return McpToolResult::error(
+            error.error_code(),
+            format!(
+                "Broadcast policy denied: {}. Allow '{}' and whitelist '{}' before submitting internally signed Lunes transactions.",
+                error, BROADCAST_POLICY_EXTRINSIC, BROADCAST_POLICY_DESTINATION
+            ),
+        );
+    }
+    let signer_account_id = match kms.public_key_bytes() {
+        Some(account_id) => account_id,
+        None => {
+            return McpToolResult::error(
+                KmsError::NotInitialized.error_code(),
+                KmsError::NotInitialized.to_string(),
+            )
+        }
+    };
+
+    let keep_alive = args
+        .get("keep_alive")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let call_name = if keep_alive {
+        "transfer_keep_alive"
+    } else {
+        "transfer_allow_death"
+    };
+
+    match lunes_client
+        .submit_native_transfer_with_ed25519(
+            signer_account_id,
+            parsed_to.account_id,
+            amount.amount_base_units,
+            call_name,
+            wait_blocks,
+            |payload| {
+                let signed = kms
+                    .sign_payload("balances.transfer", to, amount.amount_lunes, payload)
+                    .map_err(|error| LunesClientError::TransactionSubmission(error.to_string()))?;
+                ed25519_signature_from_hex(&signed.signature)
+            },
+        )
+        .await
+    {
+        Ok(submission) => McpToolResult::success(serde_json::json!({
+            "action": "balances.transfer",
+            "chain_call": format!("Balances.{call_name}"),
+            "to": to,
+            "amount_lunes": amount.amount_lunes,
+            "amount_exact_lunes": amount.exact_lunes,
+            "amount_base_units": amount.amount_base_units.to_string(),
+            "tx_hash": submission.tx_hash,
+            "status": submission.status,
+            "block_hash": submission.block_hash,
+            "block_number": submission.block_number,
+            "extrinsic_index": submission.extrinsic_index,
+            "events": submission.events,
+            "events_lookup_error": submission.events_lookup_error,
+            "archive_lookup_error": submission.archive_lookup_error,
+            "endpoint": submission.endpoint,
+            "wait_blocks": submission.wait_blocks,
+            "broadcasted": submission.broadcasted,
+            "final_error": submission.final_error,
+        })),
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeTransferAmount {
+    amount_lunes: u64,
+    amount_base_units: u128,
+    exact_lunes: String,
+}
+
+fn native_transfer_amount_from_args(args: &Value) -> Result<NativeTransferAmount, McpToolResult> {
+    let amount_lunes = args.get("amount").and_then(|value| value.as_u64());
+    let amount_base_units = optional_u128_arg(args, "amount_base_units")?;
+
+    match (amount_lunes, amount_base_units) {
+        (Some(0), _) => Err(McpToolResult::error(
+            -32001,
+            "Missing or zero required field: amount".into(),
+        )),
+        (Some(amount_lunes), maybe_base_units) => {
+            let amount_base_units = (amount_lunes as u128)
+                .checked_mul(LUNES_BASE_UNITS)
+                .ok_or_else(|| McpToolResult::error(-32001, "amount is too large".into()))?;
+            if let Some(provided_base_units) = maybe_base_units {
+                if provided_base_units != amount_base_units {
+                    return Err(McpToolResult::error(
+                        -32001,
+                        "amount_base_units must match amount when both are provided".into(),
+                    ));
+                }
+            }
+            Ok(NativeTransferAmount {
+                amount_lunes,
+                amount_base_units,
+                exact_lunes: format_lunes_amount(amount_base_units),
+            })
+        }
+        (None, Some(amount_base_units)) if amount_base_units > 0 => {
+            let amount_lunes = amount_lunes_for_policy(amount_base_units)?;
+            Ok(NativeTransferAmount {
+                amount_lunes,
+                amount_base_units,
+                exact_lunes: format_lunes_amount(amount_base_units),
+            })
+        }
+        _ => Err(McpToolResult::error(
+            -32001,
+            "Missing required field: amount or amount_base_units".into(),
+        )),
+    }
+}
+
+fn optional_u128_arg(args: &Value, field_name: &str) -> Result<Option<u128>, McpToolResult> {
+    let Some(value) = args.get(field_name) else {
+        return Ok(None);
+    };
+    if let Some(value) = value.as_u64() {
+        return Ok(Some(value as u128));
+    }
+    if let Some(value) = value.as_str() {
+        return value.parse::<u128>().map(Some).map_err(|_| {
+            McpToolResult::error(-32001, format!("{field_name} must be a positive integer"))
+        });
+    }
+    Err(McpToolResult::error(
+        -32001,
+        format!("{field_name} must be a positive integer"),
+    ))
+}
+
+fn amount_lunes_for_policy(amount_base_units: u128) -> Result<u64, McpToolResult> {
+    let rounded_up = amount_base_units
+        .checked_add(LUNES_BASE_UNITS - 1)
+        .ok_or_else(|| McpToolResult::error(-32001, "amount_base_units is too large".into()))?
+        / LUNES_BASE_UNITS;
+    u64::try_from(rounded_up).map_err(|_| {
+        McpToolResult::error(
+            -32001,
+            "amount_base_units exceeds the supported policy amount".into(),
+        )
+    })
+}
+
+fn ed25519_signature_from_hex(signature: &str) -> Result<[u8; 64], LunesClientError> {
+    let bytes = hex::decode(signature).map_err(|error| {
+        LunesClientError::TransactionSubmission(format!("invalid KMS signature hex: {error}"))
+    })?;
+    bytes.as_slice().try_into().map_err(|_| {
+        LunesClientError::TransactionSubmission(format!(
+            "invalid KMS signature length: expected 64 bytes, got {}",
+            bytes.len()
+        ))
+    })
 }
 
 fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
@@ -1987,6 +2411,241 @@ fn execute_staking_operation(
     )
 }
 
+fn handle_prepare_governance_vote(args: &Value, kms: &AgentKms) -> McpToolResult {
+    if let Some(error) = reject_governance_broadcast(args) {
+        return error;
+    }
+
+    let referendum_index = match governance_referendum_index_arg(args) {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+    let vote = match governance_vote_arg(args) {
+        Ok(vote) => vote,
+        Err(error) => return error,
+    };
+    let conviction = match governance_conviction_arg(args) {
+        Ok(conviction) => conviction,
+        Err(error) => return error,
+    };
+    let amount = match native_transfer_amount_from_args(args) {
+        Ok(amount) => amount,
+        Err(error) => return error,
+    };
+
+    if let Some(error) = validate_governance_vote_policy(
+        kms,
+        referendum_index,
+        vote,
+        conviction,
+        amount.amount_lunes,
+    ) {
+        return error;
+    }
+
+    let unsigned_payload = format!(
+        "conviction_voting.vote({referendum_index},{vote},{conviction},{})",
+        amount.amount_base_units
+    );
+
+    governance_pending_result(
+        kms,
+        serde_json::json!({
+            "action": "conviction_voting.vote",
+            "referendum_index": referendum_index,
+            "vote": {
+                "direction": vote,
+                "conviction": conviction,
+                "amount_lunes": amount.amount_lunes,
+                "amount_exact_lunes": amount.exact_lunes,
+                "amount_base_units": amount.amount_base_units.to_string(),
+            },
+            "unsigned_payload": unsigned_payload,
+            "broadcasted": false,
+            "submission_status": "not_broadcasted",
+            "signing_status": "not_signed_by_mcp",
+            "next_step": "Human must review and sign this governance vote with an external wallet.",
+        }),
+    )
+}
+
+fn handle_prepare_governance_remove_vote(args: &Value, kms: &AgentKms) -> McpToolResult {
+    if let Some(error) = reject_governance_broadcast(args) {
+        return error;
+    }
+
+    let referendum_index = match governance_referendum_index_arg(args) {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+    if let Some(error) = validate_governance_referendum_policy(kms, referendum_index) {
+        return error;
+    }
+
+    governance_pending_result(
+        kms,
+        serde_json::json!({
+            "action": "conviction_voting.remove_vote",
+            "referendum_index": referendum_index,
+            "unsigned_payload": format!("conviction_voting.remove_vote({referendum_index})"),
+            "broadcasted": false,
+            "submission_status": "not_broadcasted",
+            "signing_status": "not_signed_by_mcp",
+            "next_step": "Human must review and sign this governance remove-vote operation with an external wallet.",
+        }),
+    )
+}
+
+fn governance_pending_result(kms: &AgentKms, mut data: Value) -> McpToolResult {
+    if kms.permissions().human_approval_required {
+        if let Some(template) = &kms.permissions().approval_message_template {
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "human_approval_notice".to_string(),
+                    Value::String(template.clone()),
+                );
+            }
+        }
+    }
+
+    McpToolResult::pending(data)
+}
+
+fn reject_governance_broadcast(args: &Value) -> Option<McpToolResult> {
+    args.get("confirm_broadcast")
+        .and_then(|value| value.as_bool())
+        .filter(|confirm| *confirm)
+        .map(|_| {
+            McpToolResult::error(
+                -32011,
+                "governance tools are prepare-only and never broadcast final votes".into(),
+            )
+        })
+}
+
+fn governance_referendum_index_arg(args: &Value) -> Result<u32, McpToolResult> {
+    let Some(index) = args
+        .get("referendum_index")
+        .and_then(|value| value.as_u64())
+    else {
+        return Err(McpToolResult::error(
+            -32001,
+            "Missing required field: referendum_index".into(),
+        ));
+    };
+
+    u32::try_from(index).map_err(|_| {
+        McpToolResult::error(
+            -32001,
+            "referendum_index exceeds the supported range".into(),
+        )
+    })
+}
+
+fn governance_vote_arg(args: &Value) -> Result<&'static str, McpToolResult> {
+    match args.get("vote").and_then(|value| value.as_str()) {
+        Some("aye") => Ok("aye"),
+        Some("nay") => Ok("nay"),
+        Some(_) => Err(McpToolResult::error(
+            -32001,
+            "vote must be either aye or nay".into(),
+        )),
+        None => Err(McpToolResult::error(
+            -32001,
+            "Missing required field: vote".into(),
+        )),
+    }
+}
+
+fn governance_conviction_arg(args: &Value) -> Result<&'static str, McpToolResult> {
+    match args.get("conviction").and_then(|value| value.as_str()) {
+        Some("none") => Ok("none"),
+        Some("locked1x") => Ok("locked1x"),
+        Some("locked2x") => Ok("locked2x"),
+        Some("locked3x") => Ok("locked3x"),
+        Some("locked4x") => Ok("locked4x"),
+        Some("locked5x") => Ok("locked5x"),
+        Some("locked6x") => Ok("locked6x"),
+        Some(_) => Err(McpToolResult::error(
+            -32001,
+            "conviction must be none or locked1x through locked6x".into(),
+        )),
+        None => Err(McpToolResult::error(
+            -32001,
+            "Missing required field: conviction".into(),
+        )),
+    }
+}
+
+fn validate_governance_vote_policy(
+    kms: &AgentKms,
+    referendum_index: u32,
+    vote: &str,
+    conviction: &str,
+    amount_lunes: u64,
+) -> Option<McpToolResult> {
+    if let Some(error) = validate_governance_referendum_policy(kms, referendum_index) {
+        return Some(error);
+    }
+    let policy = &kms.permissions().governance;
+
+    if policy.max_vote_lunes == 0 || amount_lunes > policy.max_vote_lunes {
+        return Some(McpToolResult::error(
+            -32011,
+            format!(
+                "Governance vote amount {amount_lunes} LUNES exceeds configured max_vote_lunes {}",
+                policy.max_vote_lunes
+            ),
+        ));
+    }
+
+    if !policy
+        .allowed_vote_directions
+        .iter()
+        .any(|allowed| allowed == vote)
+    {
+        return Some(McpToolResult::error(
+            -32011,
+            format!("Governance vote direction '{vote}' is not allowed by policy"),
+        ));
+    }
+
+    if !policy
+        .allowed_convictions
+        .iter()
+        .any(|allowed| allowed == conviction)
+    {
+        return Some(McpToolResult::error(
+            -32011,
+            format!("Governance conviction '{conviction}' is not allowed by policy"),
+        ));
+    }
+
+    None
+}
+
+fn validate_governance_referendum_policy(
+    kms: &AgentKms,
+    referendum_index: u32,
+) -> Option<McpToolResult> {
+    let policy = &kms.permissions().governance;
+    if !policy.allow_prepare_votes {
+        return Some(McpToolResult::error(
+            -32011,
+            "Governance vote preparation is disabled by policy".into(),
+        ));
+    }
+
+    if !policy.allowed_referenda.contains(&referendum_index) {
+        return Some(McpToolResult::error(
+            -32011,
+            format!("Referendum {referendum_index} is not allowed by governance policy"),
+        ));
+    }
+
+    None
+}
+
 fn reward_destination_from_args(
     args: &Value,
     default_to_staked: bool,
@@ -2176,13 +2835,13 @@ async fn handle_read_contract(args: &Value, kms: &AgentKms, client: &LunesClient
 mod tests {
     use super::*;
     use crate::address::encode_lunes_address_for_tests;
-    use crate::config::{AgentMode, PermissionsConfig};
+    use crate::config::{AgentMode, GovernancePolicyConfig, PermissionsConfig};
     use crate::lunes_client::{
-        BlockEvents, BlockEventsLookup, BlockSummary, ChainInfo, ChainProperties, NativeBalance,
-        NetworkHealth, Nominations, RecentBlocks, RuntimeInfo, SignedExtrinsicSubmission,
-        StakingAccount, StakingLedger, StakingRewardDestination, StakingRewardDestinationKind,
-        StakingRole, TransactionState, TransactionStatus, UnlockChunk, ValidatorPrefs,
-        ValidatorProfile, ValidatorSet,
+        BlockEvents, BlockEventsLookup, BlockSummary, ChainInfo, ChainProperties,
+        GovernanceReferenda, GovernanceReferendum, NativeBalance, NetworkHealth, Nominations,
+        RecentBlocks, RuntimeInfo, SignedExtrinsicSubmission, StakingAccount, StakingLedger,
+        StakingRewardDestination, StakingRewardDestinationKind, StakingRole, TransactionState,
+        TransactionStatus, UnlockChunk, ValidatorPrefs, ValidatorProfile, ValidatorSet,
     };
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2197,6 +2856,7 @@ mod tests {
             whitelisted_addresses: vec![lunes_address(1)],
             daily_limit_lunes: 100,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
@@ -2216,6 +2876,7 @@ mod tests {
             whitelisted_addresses: vec!["staking".into(), lunes_address(8), lunes_address(9)],
             daily_limit_lunes: 1_000,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
@@ -2228,9 +2889,39 @@ mod tests {
             whitelisted_addresses: vec![BROADCAST_POLICY_DESTINATION.into()],
             daily_limit_lunes: 1,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
+        }
+    }
+
+    fn transfer_broadcast_permissions(to: &str) -> PermissionsConfig {
+        PermissionsConfig {
+            allowed_extrinsics: vec![
+                "balances.transfer".into(),
+                BROADCAST_POLICY_EXTRINSIC.into(),
+            ],
+            whitelisted_addresses: vec![to.into(), BROADCAST_POLICY_DESTINATION.into()],
+            daily_limit_lunes: 100,
+            allowlist_contracts: Default::default(),
+            governance: Default::default(),
+            ttl_hours: 168,
+            human_approval_required: true,
+            approval_message_template: None,
+        }
+    }
+
+    fn governance_permissions() -> PermissionsConfig {
+        PermissionsConfig {
+            governance: GovernancePolicyConfig {
+                allow_prepare_votes: true,
+                allowed_referenda: vec![12],
+                allowed_vote_directions: vec!["aye".into()],
+                allowed_convictions: vec!["locked1x".into()],
+                max_vote_lunes: 50,
+            },
+            ..permissions()
         }
     }
 
@@ -2254,6 +2945,23 @@ mod tests {
             endpoint: "memory://lunes".into(),
             wait_blocks: 0,
             broadcasted: true,
+            final_error: None,
+        }
+    }
+
+    fn governance_referenda_fixture() -> GovernanceReferenda {
+        GovernanceReferenda {
+            source: "static_test".into(),
+            pallet: "Referenda".into(),
+            storage_item: "ReferendumInfoFor".into(),
+            returned: 1,
+            limit: 16,
+            referenda: vec![GovernanceReferendum {
+                referendum_index: Some(12),
+                storage_key: "0x1234".into(),
+                raw_storage: Some("0x010203".into()),
+                decoded: false,
+            }],
         }
     }
 
@@ -2296,6 +3004,17 @@ mod tests {
 
     fn response_json(response: &McpToolResult) -> serde_json::Value {
         serde_json::from_str(&response.content[0].text).expect("tool response text is JSON")
+    }
+
+    fn temp_audit_log_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "lunes-mcp-{label}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]
@@ -2680,6 +3399,78 @@ mod tests {
         assert_eq!(data["nominations"]["target_count"], 1);
         assert_eq!(data["validator_prefs"]["commission_perbill"], 390_625);
         assert_eq!(data["agent_actions"]["can_prepare_staking_actions"], true);
+    }
+
+    #[tokio::test]
+    async fn get_governance_overview_reports_prepare_only_policy() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, governance_permissions());
+        let client = LunesClient::static_governance_referenda(governance_referenda_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_governance_overview".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["write_status"], "prepare_only");
+        assert_eq!(data["governance_storage"]["returned"], 1);
+        assert_eq!(
+            data["agent_actions"]["can_prepare_governance_actions"],
+            true
+        );
+        assert_eq!(
+            data["agent_actions"]["can_broadcast_governance_transactions"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn get_referenda_rejects_limit_above_cap() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_governance_referenda(governance_referenda_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_referenda".into(),
+                arguments: serde_json::json!({
+                    "limit": MAX_GOVERNANCE_REFERENDA_LIMIT + 1,
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("limit"));
+    }
+
+    #[tokio::test]
+    async fn get_referenda_returns_raw_governance_storage() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let client = LunesClient::static_governance_referenda(governance_referenda_fixture());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_referenda".into(),
+                arguments: serde_json::json!({ "limit": 16 }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["source"], "static_test");
+        assert_eq!(data["referenda"][0]["referendum_index"], 12);
+        assert_eq!(data["referenda"][0]["decoded"], false);
     }
 
     #[tokio::test]
@@ -3191,6 +3982,297 @@ mod tests {
         assert!(text.contains("not_broadcasted"));
     }
 
+    #[tokio::test]
+    async fn native_transfer_with_chain_requires_internal_signing_opt_in_before_broadcast() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var(BROADCAST_OPT_IN_ENV, "1");
+        std::env::remove_var("LUNES_MCP_ENABLE_INTERNAL_SIGNING");
+        std::env::remove_var(AUDIT_LOG_PATH_ENV);
+        let to = lunes_address(1);
+        let kms = AgentKms::new(AgentMode::Autonomous, transfer_broadcast_permissions(&to));
+        kms.provision_key().unwrap();
+        let client = LunesClient::static_submission(signed_submission());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_transfer_native".into(),
+                arguments: serde_json::json!({
+                    "to": to,
+                    "amount": 10,
+                    "confirm_broadcast": true,
+                    "wait_blocks": 0
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        std::env::remove_var(BROADCAST_OPT_IN_ENV);
+        std::env::remove_var("LUNES_MCP_ENABLE_INTERNAL_SIGNING");
+        std::env::remove_var(AUDIT_LOG_PATH_ENV);
+
+        assert!(response.is_error);
+        assert!(response.content[0]
+            .text
+            .contains("LUNES_MCP_ENABLE_INTERNAL_SIGNING"));
+        assert_eq!(kms.spent_today(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_transfer_with_chain_requires_persistent_audit_before_broadcast() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var(BROADCAST_OPT_IN_ENV, "1");
+        std::env::set_var("LUNES_MCP_ENABLE_INTERNAL_SIGNING", "1");
+        std::env::remove_var(AUDIT_LOG_PATH_ENV);
+        let to = lunes_address(1);
+        let kms = AgentKms::new(AgentMode::Autonomous, transfer_broadcast_permissions(&to));
+        kms.provision_key().unwrap();
+        let client = LunesClient::static_submission(signed_submission());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_transfer_native".into(),
+                arguments: serde_json::json!({
+                    "to": to,
+                    "amount": 10,
+                    "confirm_broadcast": true,
+                    "wait_blocks": 0
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        std::env::remove_var(BROADCAST_OPT_IN_ENV);
+        std::env::remove_var("LUNES_MCP_ENABLE_INTERNAL_SIGNING");
+        std::env::remove_var(AUDIT_LOG_PATH_ENV);
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains(AUDIT_LOG_PATH_ENV));
+        assert_eq!(kms.spent_today(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_transfer_with_chain_broadcasts_when_all_guards_pass() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var(BROADCAST_OPT_IN_ENV, "1");
+        std::env::set_var("LUNES_MCP_ENABLE_INTERNAL_SIGNING", "1");
+        let audit_log_path = temp_audit_log_path("native-transfer");
+        std::env::set_var(AUDIT_LOG_PATH_ENV, &audit_log_path);
+        let to = lunes_address(1);
+        let kms = AgentKms::new(AgentMode::Autonomous, transfer_broadcast_permissions(&to));
+        kms.provision_key().unwrap();
+        let client = LunesClient::static_submission(signed_submission());
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_transfer_native".into(),
+                arguments: serde_json::json!({
+                    "to": to,
+                    "amount": 10,
+                    "confirm_broadcast": true,
+                    "wait_blocks": 0
+                }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        std::env::remove_var(BROADCAST_OPT_IN_ENV);
+        std::env::remove_var("LUNES_MCP_ENABLE_INTERNAL_SIGNING");
+        std::env::remove_var(AUDIT_LOG_PATH_ENV);
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["action"], "balances.transfer");
+        assert_eq!(data["amount_lunes"], 10);
+        assert_eq!(data["amount_base_units"], "1000000000");
+        assert_eq!(data["broadcasted"], true);
+        assert_eq!(data["status"], "finalized");
+        assert_eq!(
+            data["tx_hash"],
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        let audit_log = std::fs::read_to_string(&audit_log_path).unwrap();
+        let _ = std::fs::remove_file(&audit_log_path);
+        assert!(audit_log.contains("\"action\":\"SIGN\""));
+        assert!(audit_log.contains("\"extrinsic\":\"balances.transfer\""));
+        assert!(!audit_log.contains("lunes-mcp-static-native-transfer"));
+    }
+
+    #[test]
+    fn prepare_governance_vote_returns_pending_without_signature() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, governance_permissions());
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 12,
+                    "vote": "aye",
+                    "conviction": "locked1x",
+                    "amount": 10
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["status"], "pending_human_approval");
+        assert_eq!(data["data"]["action"], "conviction_voting.vote");
+        assert_eq!(data["data"]["broadcasted"], false);
+        assert_eq!(data["data"]["signing_status"], "not_signed_by_mcp");
+        assert!(data["data"].get("signature").is_none());
+        assert!(data["data"].get("tx_hash").is_none());
+    }
+
+    #[test]
+    fn prepare_governance_vote_never_signs_in_autonomous_mode() {
+        let kms = AgentKms::new(AgentMode::Autonomous, governance_permissions());
+        kms.provision_key().unwrap();
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 12,
+                    "vote": "aye",
+                    "conviction": "locked1x",
+                    "amount": 10
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["data"]["signing_status"], "not_signed_by_mcp");
+        assert!(data["data"].get("signature").is_none());
+        assert_eq!(kms.spent_today(), 0);
+    }
+
+    #[test]
+    fn prepare_governance_vote_rejects_broadcast_confirmation() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, governance_permissions());
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 12,
+                    "vote": "aye",
+                    "conviction": "locked1x",
+                    "amount": 10,
+                    "confirm_broadcast": true
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("prepare-only"));
+    }
+
+    #[test]
+    fn prepare_governance_vote_requires_explicit_policy() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 12,
+                    "vote": "aye",
+                    "conviction": "locked1x",
+                    "amount": 10
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0]
+            .text
+            .contains("Governance vote preparation"));
+    }
+
+    #[test]
+    fn prepare_governance_vote_enforces_referendum_direction_conviction_and_amount() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, governance_permissions());
+
+        let blocked_referendum = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 13,
+                    "vote": "aye",
+                    "conviction": "locked1x",
+                    "amount": 10
+                }),
+            },
+            &kms,
+        );
+        assert!(blocked_referendum.is_error);
+        assert!(blocked_referendum.content[0].text.contains("Referendum 13"));
+
+        let blocked_vote = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 12,
+                    "vote": "nay",
+                    "conviction": "locked1x",
+                    "amount": 10
+                }),
+            },
+            &kms,
+        );
+        assert!(blocked_vote.is_error);
+        assert!(blocked_vote.content[0].text.contains("direction"));
+
+        let blocked_amount = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 12,
+                    "vote": "aye",
+                    "conviction": "locked1x",
+                    "amount": 51
+                }),
+            },
+            &kms,
+        );
+        assert!(blocked_amount.is_error);
+        assert!(blocked_amount.content[0].text.contains("max_vote_lunes"));
+    }
+
+    #[test]
+    fn prepare_governance_remove_vote_is_pending_and_policy_bound() {
+        let kms = AgentKms::new(AgentMode::Autonomous, governance_permissions());
+        kms.provision_key().unwrap();
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_prepare_governance_remove_vote".into(),
+                arguments: serde_json::json!({
+                    "referendum_index": 12
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["data"]["action"], "conviction_voting.remove_vote");
+        assert_eq!(data["data"]["broadcasted"], false);
+        assert!(data["data"].get("signature").is_none());
+        assert_eq!(kms.spent_today(), 0);
+    }
+
     #[test]
     fn psp22_transfer_consumes_daily_budget() {
         let contract = lunes_address(2);
@@ -3204,6 +4286,7 @@ mod tests {
                 whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 5,
                 allowlist_contracts,
+                governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
                 approval_message_template: None,
@@ -3238,6 +4321,7 @@ mod tests {
                 whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 100,
                 allowlist_contracts: Default::default(),
+                governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
                 approval_message_template: None,
@@ -3270,6 +4354,7 @@ mod tests {
                 whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 100,
                 allowlist_contracts: Default::default(),
+                governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
                 approval_message_template: None,
@@ -3333,7 +4418,7 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 35);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_assets"));
         assert!(tools
@@ -3360,6 +4445,12 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_staking_account"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_governance_overview"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_referenda"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_chain_info"));
@@ -3392,6 +4483,12 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_stake_nominate"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_prepare_governance_vote"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_prepare_governance_remove_vote"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_transfer_native"));
@@ -3431,6 +4528,7 @@ mod tests {
                 whitelisted_addresses: vec!["staking".into(), lunes_address(8)],
                 daily_limit_lunes: 1_000,
                 allowlist_contracts: Default::default(),
+                governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
                 approval_message_template: None,

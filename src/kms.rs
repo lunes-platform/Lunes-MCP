@@ -388,6 +388,12 @@ impl AgentKms {
         state.public_key.as_ref().map(|k| hex::encode(k.as_bytes()))
     }
 
+    /// Returns the public key bytes when provisioned.
+    pub fn public_key_bytes(&self) -> Option<[u8; 32]> {
+        let state = self.state.lock();
+        state.public_key.as_ref().map(|k| *k.as_bytes())
+    }
+
     /// Returns whether autonomous signing is enabled.
     pub fn is_autonomous(&self) -> bool {
         self.mode == AgentMode::Autonomous
@@ -417,6 +423,11 @@ impl AgentKms {
 
     pub fn permissions(&self) -> &PermissionsConfig {
         &self.permissions
+    }
+
+    /// Returns whether successful signing attempts are mirrored to an external audit log.
+    pub fn persistent_audit_log_enabled(&self) -> bool {
+        self.audit_log_path.is_some()
     }
 
     /// Returns whether a non-expired key is provisioned.
@@ -714,6 +725,7 @@ mod tests {
             whitelisted_addresses: vec!["5Gxyz".into(), "5G".into()],
             daily_limit_lunes: 100,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
@@ -779,6 +791,7 @@ mod tests {
             whitelisted_addresses: vec![],
             daily_limit_lunes: 100,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
@@ -799,6 +812,7 @@ mod tests {
             whitelisted_addresses: vec![],
             daily_limit_lunes: 100,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
@@ -832,6 +846,7 @@ mod tests {
             whitelisted_addresses: vec!["5Gxyz".into()],
             daily_limit_lunes: 0,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
@@ -852,6 +867,7 @@ mod tests {
             whitelisted_addresses: vec!["5Gxyz".into()],
             daily_limit_lunes: u64::MAX,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,
@@ -874,6 +890,7 @@ mod tests {
             whitelisted_addresses: vec!["5GoodAddress".into()],
             daily_limit_lunes: 1000,
             allowlist_contracts: Default::default(),
+            governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
             approval_message_template: None,

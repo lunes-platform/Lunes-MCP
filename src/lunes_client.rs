@@ -12,6 +12,11 @@ use jsonrpsee::{
 use serde::Serialize;
 use serde_json::Value;
 use std::{collections::HashSet, convert::TryInto, sync::Arc, time::Duration};
+use subxt::{
+    dynamic,
+    utils::{AccountId32, MultiAddress, MultiSignature},
+    OnlineClient, PolkadotConfig,
+};
 
 const LUNES_ACCOUNT_STORAGE_PREFIX: &str =
     "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9";
@@ -33,6 +38,7 @@ pub struct LunesClient {
     static_submission: Option<SignedExtrinsicSubmission>,
     static_recent_blocks: Option<RecentBlocks>,
     static_block_events: Option<BlockEventsLookup>,
+    static_governance_referenda: Option<GovernanceReferenda>,
 }
 
 impl LunesClient {
@@ -54,6 +60,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -73,6 +80,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -92,6 +100,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -111,6 +120,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -130,6 +140,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -149,6 +160,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -168,6 +180,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -187,6 +200,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -206,6 +220,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -225,6 +240,7 @@ impl LunesClient {
             static_submission: Some(submission),
             static_recent_blocks: None,
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -244,6 +260,7 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: Some(recent_blocks),
             static_block_events: None,
+            static_governance_referenda: None,
         }
     }
 
@@ -263,6 +280,27 @@ impl LunesClient {
             static_submission: None,
             static_recent_blocks: None,
             static_block_events: Some(block_events),
+            static_governance_referenda: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn static_governance_referenda(governance_referenda: GovernanceReferenda) -> Self {
+        Self {
+            endpoints: Arc::new(vec!["memory://lunes".into()]),
+            archive_endpoint: None,
+            static_info: None,
+            static_native_balance: None,
+            static_transaction_status: None,
+            static_account_next_index: None,
+            static_network_health: None,
+            static_validator_set: None,
+            static_staking_account: None,
+            static_validator_profiles: None,
+            static_submission: None,
+            static_recent_blocks: None,
+            static_block_events: None,
+            static_governance_referenda: Some(governance_referenda),
         }
     }
 
@@ -485,6 +523,44 @@ impl LunesClient {
         Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
     }
 
+    pub async fn submit_native_transfer_with_ed25519<F>(
+        &self,
+        signer_account_id: [u8; 32],
+        destination_account_id: [u8; 32],
+        amount_base_units: u128,
+        call_name: &str,
+        wait_blocks: u64,
+        sign_payload: F,
+    ) -> Result<SignedExtrinsicSubmission, LunesClientError>
+    where
+        F: Fn(&[u8]) -> Result<[u8; 64], LunesClientError>,
+    {
+        if let Some(submission) = &self.static_submission {
+            sign_payload(b"lunes-mcp-static-native-transfer")?;
+            return Ok(submission.clone());
+        }
+
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match submit_native_transfer_with_ed25519(
+                endpoint,
+                signer_account_id,
+                destination_account_id,
+                amount_base_units,
+                call_name,
+                wait_blocks,
+                &sign_payload,
+            )
+            .await
+            {
+                Ok(submission) => return Ok(submission),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
     pub async fn recent_blocks(
         &self,
         lookback_blocks: u64,
@@ -550,6 +626,25 @@ impl LunesClient {
             .await
             {
                 Ok(block_events) => return Ok(block_events),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(LunesClientError::NoRpcEndpoints))
+    }
+
+    pub async fn governance_referenda(
+        &self,
+        limit: usize,
+    ) -> Result<GovernanceReferenda, LunesClientError> {
+        if let Some(governance_referenda) = &self.static_governance_referenda {
+            return Ok(governance_referenda.clone());
+        }
+
+        let mut last_error = None;
+        for endpoint in self.endpoints.iter() {
+            match fetch_governance_referenda(endpoint, limit).await {
+                Ok(referenda) => return Ok(referenda),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -1014,6 +1109,107 @@ async fn submit_signed_extrinsic(
         endpoint: endpoint.to_string(),
         wait_blocks,
         broadcasted: true,
+        final_error: None,
+    })
+}
+
+async fn submit_native_transfer_with_ed25519<F>(
+    endpoint: &str,
+    signer_account_id: [u8; 32],
+    destination_account_id: [u8; 32],
+    amount_base_units: u128,
+    call_name: &str,
+    wait_blocks: u64,
+    sign_payload: &F,
+) -> Result<SignedExtrinsicSubmission, LunesClientError>
+where
+    F: Fn(&[u8]) -> Result<[u8; 64], LunesClientError>,
+{
+    let api = OnlineClient::<PolkadotConfig>::from_url(endpoint)
+        .await
+        .map_err(|error| LunesClientError::RpcConnection {
+            endpoint: redact_rpc_endpoint(endpoint),
+            message: error.to_string(),
+        })?;
+    let tx_client = api
+        .tx()
+        .await
+        .map_err(|error| LunesClientError::TransactionSubmission(error.to_string()))?;
+    let signer_account = AccountId32(signer_account_id);
+    let destination = MultiAddress::<AccountId32, ()>::Id(AccountId32(destination_account_id));
+    let tx_payload = dynamic::transaction("Balances", call_name, (destination, amount_base_units));
+    let mut signable = tx_client
+        .create_signable(&tx_payload, &signer_account, Default::default())
+        .await
+        .map_err(|error| LunesClientError::TransactionSubmission(error.to_string()))?;
+    let signer_payload = signable
+        .signer_payload()
+        .map_err(|error| LunesClientError::TransactionSubmission(error.to_string()))?;
+    let signature = sign_payload(&signer_payload)?;
+    let signature = MultiSignature::Ed25519(signature);
+    let submittable = signable
+        .sign_with_account_and_signature(&signer_account, &signature)
+        .map_err(|error| LunesClientError::TransactionSubmission(error.to_string()))?;
+    let progress = submittable
+        .submit_and_watch()
+        .await
+        .map_err(|error| LunesClientError::TransactionSubmission(error.to_string()))?;
+    let wait_seconds = wait_blocks.max(1).saturating_mul(12);
+    let in_block = tokio::time::timeout(
+        Duration::from_secs(wait_seconds),
+        progress.wait_for_finalized(),
+    )
+    .await
+    .map_err(|_| {
+        LunesClientError::TransactionSubmission(format!(
+            "timed out waiting {wait_seconds}s for finalization"
+        ))
+    })?
+    .map_err(|error| LunesClientError::TransactionSubmission(error.to_string()))?;
+    let block_hash = hash_to_hex(in_block.block_hash().as_bytes());
+    let tx_hash = hash_to_hex(in_block.extrinsic_hash().as_bytes());
+
+    let extrinsic_events = in_block.fetch_events().await;
+    let extrinsic_index = extrinsic_events
+        .as_ref()
+        .ok()
+        .map(|events| events.extrinsic_index());
+    let final_error = match in_block.wait_for_success().await {
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    let status = if final_error.is_some() {
+        TransactionState::FinalizedFailed
+    } else {
+        TransactionState::Finalized
+    };
+
+    let client = connect_client(endpoint).await?;
+    let block_number = fetch_block(&client, &block_hash)
+        .await?
+        .map(|block| block.number);
+    let mut events_lookup_error = None;
+    let events = match fetch_block_events_raw(&client, &block_hash).await {
+        Ok(events) => events,
+        Err(error) => {
+            events_lookup_error = Some(error.to_string());
+            None
+        }
+    };
+
+    Ok(SignedExtrinsicSubmission {
+        tx_hash,
+        status,
+        block_hash: Some(block_hash),
+        block_number,
+        extrinsic_index,
+        events,
+        events_lookup_error,
+        archive_lookup_error: None,
+        endpoint: endpoint.to_string(),
+        wait_blocks,
+        broadcasted: true,
+        final_error,
     })
 }
 
@@ -1098,6 +1294,49 @@ async fn fetch_block_events_raw(
         raw_storage: raw,
         decoded: false,
     }))
+}
+
+async fn fetch_governance_referenda(
+    endpoint: &str,
+    limit: usize,
+) -> Result<GovernanceReferenda, LunesClientError> {
+    let client = connect_client(endpoint).await?;
+    let prefix = storage_prefix_key("Referenda", "ReferendumInfoFor");
+    let keys: Vec<String> = rpc_request_params(
+        &client,
+        "state_getKeysPaged",
+        vec![
+            Value::String(prefix),
+            Value::Number(serde_json::Number::from(limit as u64)),
+        ],
+    )
+    .await?;
+
+    let mut referenda = Vec::with_capacity(keys.len());
+    for storage_key in keys {
+        let raw_storage: Option<String> = rpc_request_params(
+            &client,
+            "state_getStorage",
+            vec![Value::String(storage_key.clone())],
+        )
+        .await?;
+        referenda.push(GovernanceReferendum {
+            referendum_index: referendum_index_from_storage_key(&storage_key),
+            storage_key,
+            raw_storage,
+            decoded: false,
+        });
+    }
+
+    referenda.sort_by_key(|referendum| referendum.referendum_index.unwrap_or(u32::MAX));
+    Ok(GovernanceReferenda {
+        source: "live_lunes_rpc_governance_storage".into(),
+        pallet: "Referenda".into(),
+        storage_item: "ReferendumInfoFor".into(),
+        returned: referenda.len(),
+        limit,
+        referenda,
+    })
 }
 
 async fn fetch_recent_account_activity(
@@ -1620,12 +1859,31 @@ pub struct SignedExtrinsicSubmission {
     pub endpoint: String,
     pub wait_blocks: u64,
     pub broadcasted: bool,
+    pub final_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BlockEvents {
     pub block_hash: String,
     pub raw_storage: String,
+    pub decoded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GovernanceReferenda {
+    pub source: String,
+    pub pallet: String,
+    pub storage_item: String,
+    pub returned: usize,
+    pub limit: usize,
+    pub referenda: Vec<GovernanceReferendum>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GovernanceReferendum {
+    pub referendum_index: Option<u32>,
+    pub storage_key: String,
+    pub raw_storage: Option<String>,
     pub decoded: bool,
 }
 
@@ -1760,6 +2018,7 @@ impl TransactionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TransactionState {
     Finalized,
+    FinalizedFailed,
     InBestBlock,
     InPool,
     NotFound,
@@ -1833,6 +2092,8 @@ pub enum LunesClientError {
     InvalidTransactionHash(String),
     #[error("invalid signed extrinsic: {0}")]
     InvalidSignedExtrinsic(String),
+    #[error("Lunes transaction submission failed: {0}")]
+    TransactionSubmission(String),
 }
 
 fn required_string(value: &Value, key: &str) -> Result<String, LunesClientError> {
@@ -1912,6 +2173,13 @@ fn storage_map_key(
         }
     }
     format!("0x{}", hex::encode(key))
+}
+
+fn referendum_index_from_storage_key(storage_key: &str) -> Option<u32> {
+    let bytes = decode_hex_string(storage_key).ok()?;
+    let index_offset = 32 + 8;
+    let raw = bytes.get(index_offset..index_offset + 4)?;
+    Some(u32::from_le_bytes(raw.try_into().ok()?))
 }
 
 fn twox128(input: &[u8]) -> [u8; 16] {
@@ -2387,7 +2655,7 @@ fn transaction_hash_to_bytes(hex_value: &str) -> Result<Vec<u8>, LunesClientErro
 
 fn decode_hex_string(hex_value: &str) -> Result<Vec<u8>, String> {
     let value = hex_value.strip_prefix("0x").unwrap_or(hex_value);
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("hex string must have an even number of characters".into());
     }
     hex::decode(value).map_err(|error| error.to_string())
@@ -2439,6 +2707,10 @@ fn lunes_payload_hash_hex(payload: &[u8]) -> String {
     format!("0x{}", hex::encode(blake2_hash::<32>(payload)))
 }
 
+fn hash_to_hex(hash: &[u8]) -> String {
+    format!("0x{}", hex::encode(hash))
+}
+
 fn extrinsic_hash_matches(extrinsic: &str, tx_hash: &str) -> bool {
     hex_to_bytes(extrinsic)
         .map(|bytes| lunes_payload_hash_hex(&bytes).eq_ignore_ascii_case(tx_hash))
@@ -2470,6 +2742,23 @@ mod tests {
         bytes.extend_from_slice(&frozen.to_le_bytes());
         bytes.extend_from_slice(&flags.to_le_bytes());
         format!("0x{}", hex::encode(bytes))
+    }
+
+    fn referendum_storage_key(index: u32) -> String {
+        let mut bytes = hex_to_bytes(&storage_prefix_key("Referenda", "ReferendumInfoFor"))
+            .expect("storage prefix is valid hex");
+        let index_bytes = index.to_le_bytes();
+        bytes.extend_from_slice(&xxhash64(&index_bytes, 0).to_le_bytes());
+        bytes.extend_from_slice(&index_bytes);
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    #[test]
+    fn decodes_referendum_index_from_twox64concat_storage_key() {
+        assert_eq!(
+            referendum_index_from_storage_key(&referendum_storage_key(42)),
+            Some(42)
+        );
     }
 
     #[test]
@@ -2791,6 +3080,7 @@ mod tests {
             endpoint: "memory://lunes".into(),
             wait_blocks: 0,
             broadcasted: true,
+            final_error: None,
         };
         let client = LunesClient::static_submission(submission.clone());
 
