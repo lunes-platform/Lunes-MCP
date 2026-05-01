@@ -18,6 +18,8 @@
   policy required.
 - Required explicit contract/message allowlists for PSP22 and generic contract
   write preparation, and blocked autonomous generic contract-call signing.
+- Expanded contract discovery responses with configured message allowlists and
+  local PSP22 asset policy metadata.
 - Added raw event storage to transaction status responses when available.
 - Added bounded recent block summaries, raw block event lookup, and account
   activity timeline entries without returning raw extrinsics from block summary

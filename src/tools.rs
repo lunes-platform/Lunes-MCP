@@ -124,7 +124,7 @@ fn validate_address(address: &str, field_name: &str) -> Result<(), McpToolResult
 pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolResult {
     match request.name.as_str() {
         // Read-only queries that do not need live RPC
-        "lunes_search_contract" => handle_search_contract(&request.arguments),
+        "lunes_search_contract" => handle_search_contract(&request.arguments, kms),
         "lunes_validate_address" => handle_validate_address(&request.arguments),
         "lunes_get_permissions" => handle_get_permissions(kms),
         "lunes_get_assets" => handle_get_assets(kms),
@@ -1627,7 +1627,7 @@ fn can_broadcast_to_lunes_network(kms: &AgentKms) -> bool {
             .is_ok()
 }
 
-fn handle_search_contract(args: &Value) -> McpToolResult {
+fn handle_search_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
     let contract_address = args
         .get("contract_address")
         .and_then(|v| v.as_str())
@@ -1638,12 +1638,26 @@ fn handle_search_contract(args: &Value) -> McpToolResult {
     }
 
     let registry = AbiRegistry::new();
+    let allowed_messages = kms
+        .permissions()
+        .allowlist_contracts
+        .get(contract_address)
+        .cloned()
+        .unwrap_or_default();
+    let asset_policy = kms.permissions().asset_policies.get(contract_address);
     McpToolResult::success(serde_json::json!({
         "contract_address": contract_address,
         "metadata_source": "local_lunes_contract_interface_registry",
         "known_interfaces": ["PSP22"],
         "known_messages": registry.known_messages(),
-        "note": "Live contract metadata lookup is planned; this response exposes the local interface registry used by agent guardrails."
+        "policy": {
+            "contract_allowlisted": !allowed_messages.is_empty(),
+            "allowed_messages": allowed_messages,
+            "autonomous_generic_call_signing": false,
+        },
+        "psp22_asset_metadata": psp22_asset_metadata_json(asset_policy),
+        "psp22_transfer_policy": psp22_transfer_policy_json(asset_policy),
+        "note": "Live contract metadata lookup is planned; this response exposes the local interface registry and configured policy used by agent guardrails."
     }))
 }
 
@@ -4500,6 +4514,47 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.content[0].text.contains("allowlisted"));
+    }
+
+    #[test]
+    fn search_contract_includes_local_policy_and_asset_metadata() {
+        let contract = lunes_address(2);
+        let recipient = lunes_address(3);
+        let mut allowlist_contracts = std::collections::HashMap::new();
+        allowlist_contracts.insert(
+            contract.clone(),
+            vec!["PSP22::balance_of".into(), "PSP22::transfer".into()],
+        );
+        let mut asset_policies = std::collections::HashMap::new();
+        asset_policies.insert(contract.clone(), psp22_asset_policy(1_000, vec![recipient]));
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowlist_contracts,
+                asset_policies,
+                ..permissions()
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_search_contract".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["policy"]["contract_allowlisted"], true);
+        assert_eq!(data["policy"]["allowed_messages"][0], "PSP22::balance_of");
+        assert_eq!(data["psp22_asset_metadata"]["symbol"], "POL");
+        assert_eq!(
+            data["psp22_transfer_policy"]["max_transfer_base_units"],
+            "1000"
+        );
     }
 
     #[tokio::test]

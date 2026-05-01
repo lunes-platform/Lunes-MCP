@@ -89,7 +89,7 @@ action passes through explicit server-side policy.
 | Staking management | Prepare bond, unbond, withdraw, nominate, chill, and reward-destination updates |
 | Governance visibility | Read bounded raw referendum storage and current prepare-only governance policy |
 | Governance preparation | Prepare human-review vote and remove-vote payloads without MCP signing or broadcast |
-| Contract discovery | Look up Lunes contract interface metadata through the tooling surface |
+| Contract discovery | Look up Lunes contract interface metadata, message allowlists, and local asset policy through the tooling surface |
 | Transfer preparation | Build human-reviewable payloads for native LUNES and policy-limited PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
 | Policy-bounded signing | Sign local intent payloads only when autonomous mode, allowlists, TTL, and spend limits permit it |
@@ -515,7 +515,7 @@ use a client with HTTP MCP transport support.
 | `lunes_get_block_events` | Read | Reads raw event storage for a block by hash, number, or finalized head |
 | `lunes_search_account_activity` | Read | Searches pending transactions and recent finalized blocks for bounded account activity, including timeline entries |
 | `lunes_read_contract` | Read | Simulates a read-only Lunes contract call through live RPC when allowed by contract message policy |
-| `lunes_search_contract` | Read | Looks up Lunes contract interface metadata |
+| `lunes_search_contract` | Read | Looks up Lunes contract interface metadata plus configured message allowlists and local PSP22 policy |
 | `lunes_transfer_native` | Write | Prepares, locally signs, or guarded-broadcasts a native LUNES transfer |
 | `lunes_transfer_psp22` | Write | Prepares or signs a PSP22 transfer only when contract/message, recipient, and asset-specific base-unit limits pass |
 | `lunes_call_contract` | Write | Prepares a Lunes contract call; autonomous generic calls are blocked in favor of specialized policy-checked tools |

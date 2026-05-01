@@ -76,6 +76,7 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_prepare_governance_vote` | Prepare | Prepare a human-review governance vote payload without signing or broadcasting |
 | `lunes_prepare_governance_remove_vote` | Prepare | Prepare a human-review remove-vote payload without signing or broadcasting |
 | `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
+| `lunes_search_contract` | Read | Look up local interface metadata, configured message allowlists, and PSP22 asset policy |
 
 ## Project Structure
 
@@ -214,4 +215,6 @@ Never:
   payloads without final network submission; payout requires a whitelisted
   validator stash.
 - `lunes_read_contract` requires contract message allowlists before live reads.
+- `lunes_search_contract` exposes the local interface registry together with
+  configured contract/message policy; it does not claim live ABI discovery.
 - All verification commands pass before publishing.
