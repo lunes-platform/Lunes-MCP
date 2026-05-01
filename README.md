@@ -209,8 +209,10 @@ the agent may use:
 allowed_extrinsics = [
   "staking.bond",
   "staking.unbond",
+  "staking.rebond",
   "staking.withdraw_unbonded",
   "staking.nominate",
+  "staking.payout_stakers",
   "staking.chill",
   "staking.set_payee"
 ]
@@ -500,6 +502,7 @@ use a client with HTTP MCP transport support.
 | `lunes_get_validator_set` | Read | Reads the current validator set from live Lunes Network state |
 | `lunes_get_staking_overview` | Read | Summarizes validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_validator_profiles` | Read | Reads validator active-set status, commission, blocked state, and nomination eligibility |
+| `lunes_get_validator_scores` | Read | Scores validators from observable profile data; exposure and reward history are explicitly marked as not decoded |
 | `lunes_get_staking_account` | Read | Reads live staking state for one account, including bond, ledger, unlocking schedule, rewards destination, nominations, and validator preferences when present |
 | `lunes_get_governance_overview` | Read | Summarizes raw referendum visibility and prepare-only governance policy |
 | `lunes_get_referenda` | Read | Reads bounded raw referendum storage entries from live Lunes governance state |
@@ -518,8 +521,10 @@ use a client with HTTP MCP transport support.
 | `lunes_call_contract` | Write | Prepares a Lunes contract call; autonomous generic calls are blocked in favor of specialized policy-checked tools |
 | `lunes_stake_bond` | Write | Prepares or signs a staking bond operation |
 | `lunes_stake_unbond` | Write | Prepares or signs a staking unbond operation |
+| `lunes_stake_rebond` | Write | Prepares or signs a staking rebond operation |
 | `lunes_stake_withdraw_unbonded` | Write | Prepares or signs withdrawal of unlocked staking funds |
 | `lunes_stake_nominate` | Write | Prepares or signs validator nominations |
+| `lunes_stake_payout` | Write | Prepares or signs `staking.payout_stakers` for a whitelisted validator stash and era |
 | `lunes_stake_chill` | Write | Prepares or signs a pause of active nominations |
 | `lunes_stake_set_payee` | Write | Prepares or signs staking reward destination updates |
 | `lunes_prepare_governance_vote` | Prepare | Builds a human-review governance vote payload without signing or broadcasting |

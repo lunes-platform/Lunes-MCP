@@ -9,6 +9,10 @@ The next safe slice is governance visibility and preparation: read bounded raw
 referendum storage, expose the explicit governance policy, and prepare vote
 payloads for human review without local signing or broadcast.
 
+The current staking slice adds policy-bound rebond and payout preparation plus
+partial validator scoring from observable profile data. It does not decode
+validator exposure, reward payout history, or choose validators automatically.
+
 ## Tech Stack
 - Rust 1.88, Tokio async runtime, jsonrpsee HTTP/WebSocket RPC.
 - `ed25519-dalek` remains the local KMS signer.
@@ -68,12 +72,19 @@ Use typed structs for internal chain results. Keep `serde_json::Value` only at M
   `lunes_prepare_governance_remove_vote` require dedicated governance policy,
   reject `confirm_broadcast=true`, return `pending_human_approval`, and never
   call KMS signing.
+- `lunes_stake_rebond` and `lunes_stake_payout` prepare or locally sign intent
+  payloads only; payout requires a whitelisted validator stash.
+- `lunes_get_validator_scores` returns bounded partial scores using active-set
+  status, commission, blocked state, and nomination eligibility, while marking
+  exposure and reward history as not decoded.
 - `cargo fmt --check`, `cargo test --locked`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release --locked` pass.
 
 ## Open Questions
 - Whether Lunes production runtime accepts Ed25519 `MultiSignature` for funded accounts; the client implementation is guarded, but a funded live test is needed before production use.
 - Whether `Balances.transfer_allow_death` or `Balances.transfer_keep_alive` should be the default operator policy; this slice defaults to allow-death unless `keep_alive=true`.
 - Asset-aware, staking-write, contract-write, and final governance-write broadcasts need separate policies and specs before being enabled.
+- Validator exposure, reward payout history, and slash/performance history need
+  explicit runtime/indexer-backed decoding before they can influence scores.
 - Governance reads currently expose raw referendum storage. Metadata-aware
   decoding, track details, account voting history, and proposal preimage
   resolution remain future network/indexer work.

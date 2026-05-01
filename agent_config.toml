@@ -30,7 +30,8 @@ mode = "prepare_only"
 
 [agent.permissions]
 # Extrinsics the agent may invoke. Empty means no write operation is allowed.
-# Examples: "balances.transfer", "staking.bond", "staking.nominate".
+# Examples: "balances.transfer", "staking.bond", "staking.rebond",
+# "staking.payout_stakers", "staking.nominate".
 # Externally signed relay requires "author.submit_extrinsic".
 allowed_extrinsics = []
 

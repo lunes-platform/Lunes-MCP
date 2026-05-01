@@ -44,10 +44,10 @@ The `.gitignore` blocks these patterns by default.
 
 ## Current Security Limitations
 
-- Lunes Network metadata, health, native balances, allowlisted PSP22 balance dry-runs, account nonce, validator set, validator profiles, account staking state, bounded account activity scans, recent block summaries, raw block event lookup, bounded raw governance referendum reads, read-only contract simulation, externally signed extrinsic submission, guarded native LUNES transfer submission, and bounded archive-assisted transaction lookup use live RPC.
-- PSP22 decoded balance values, automatic token metadata discovery, governance metadata decoding, account voting history, performance scoring, indexed full-history transaction search, and KMS-built staking/generic-contract/governance transaction signing still need full network-backed implementations.
+- Lunes Network metadata, health, native balances, allowlisted PSP22 balance dry-runs, account nonce, validator set, validator profiles, bounded validator scoring from profile data, account staking state, bounded account activity scans, recent block summaries, raw block event lookup, bounded raw governance referendum reads, read-only contract simulation, externally signed extrinsic submission, guarded native LUNES transfer submission, and bounded archive-assisted transaction lookup use live RPC.
+- PSP22 decoded balance values, automatic token metadata discovery, governance metadata decoding, account voting history, decoded validator exposure, reward payout history, indexed full-history transaction search, and KMS-built staking/generic-contract/governance transaction signing still need full network-backed implementations.
 - Recent block summaries intentionally omit raw extrinsics; account activity timelines use raw account-id substring matching and can miss encoded relationships that require a full indexer or metadata-aware decoding.
-- Staking write tools prepare or locally sign intent payloads only; validator and reward-account choices must be explicitly whitelisted.
+- Staking write tools prepare or locally sign intent payloads only; validator, payout, and reward-account choices must be explicitly whitelisted.
 - Governance preparation requires a dedicated referendum/direction/conviction/amount policy and never signs locally, even when autonomous mode is active.
 - SS58 validation checks the Lunes Network prefix and checksum, but it does not prove account ownership.
 - Autonomous signatures are local intent payload signatures except for guarded native LUNES transfer broadcast, which builds and signs a final network transaction only after all internal signing guardrails pass.

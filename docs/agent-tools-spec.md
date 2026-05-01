@@ -59,6 +59,7 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_get_investment_position` | Read | Summarize liquid and reserved/locked LUNES for staking or treasury planning |
 | `lunes_get_validator_set` | Read | Read the current validator set from live Lunes Network state |
 | `lunes_get_validator_profiles` | Read | Read active-set status, commission, blocked state, and nomination eligibility for validators |
+| `lunes_get_validator_scores` | Read | Score validators from observable profile data while marking exposure and reward history as not decoded |
 | `lunes_get_staking_overview` | Read | Summarize validator visibility and the staking actions this agent is allowed to prepare |
 | `lunes_get_staking_account` | Read | Read bond, ledger, unlocking schedule, reward destination, nominations, and validator preferences for one Lunes account |
 | `lunes_get_governance_overview` | Read | Summarize raw referendum storage visibility and prepare-only governance policy |
@@ -70,6 +71,8 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_transfer_native` | Write | Prepare, locally sign, or guarded-broadcast a native LUNES transfer |
 | `lunes_transfer_psp22` | Write | Prepare or locally sign a PSP22 transfer after contract/message, recipient, and asset-limit checks |
 | `lunes_call_contract` | Write | Prepare generic contract calls; autonomous generic signing is disabled |
+| `lunes_stake_rebond` | Write | Prepare or locally sign a staking rebond operation |
+| `lunes_stake_payout` | Write | Prepare or locally sign `staking.payout_stakers` for a whitelisted validator stash and era |
 | `lunes_prepare_governance_vote` | Prepare | Prepare a human-review governance vote payload without signing or broadcasting |
 | `lunes_prepare_governance_remove_vote` | Prepare | Prepare a human-review remove-vote payload without signing or broadcasting |
 | `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
@@ -149,7 +152,7 @@ Ask first:
 - changing public tool names or response fields;
 - enabling additional internal final Lunes Network transaction categories such
   as staking, generic contracts, or governance;
-- expanding staking reads into reward payout history, performance scoring, or
+- expanding staking reads into reward payout history, decoded exposure, or
   automated validator selection.
 
 Never:
@@ -176,6 +179,9 @@ Never:
 - `lunes_get_validator_set` reads validator addresses from live network state.
 - `lunes_get_validator_profiles` returns bounded validator profile and
   nomination eligibility hints without making recommendations.
+- `lunes_get_validator_scores` returns a bounded partial score from observable
+  validator profile data and explicitly marks exposure/reward history as not
+  decoded.
 - `lunes_get_staking_overview` combines validator visibility with local policy
   boundaries.
 - `lunes_get_staking_account` returns live staking state, including unlocking
@@ -204,5 +210,8 @@ Never:
 - `lunes_transfer_psp22` rejects transfers without contract/message allowlists,
   an asset-specific base-unit limit, and an allowed recipient; it does not
   consume the native LUNES daily budget for token amounts.
+- `lunes_stake_rebond` and `lunes_stake_payout` return policy-bound staking
+  payloads without final network submission; payout requires a whitelisted
+  validator stash.
 - `lunes_read_contract` requires contract message allowlists before live reads.
 - All verification commands pass before publishing.

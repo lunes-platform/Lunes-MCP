@@ -30,6 +30,10 @@
   strings, and fragments.
 - Added staking preparation tools for bond, unbond, withdraw, nominate, chill,
   and reward destination updates.
+- Added staking rebond and payout preparation tools, with payout constrained to
+  whitelisted validator stash addresses.
+- Added bounded validator scoring from observable validator profile data, while
+  explicitly marking exposure and reward history as not decoded.
 - Added governance read/preparation tools for bounded raw referendum storage,
   explicit prepare-only vote policy, and human-review vote/remove-vote payloads
   that never sign or broadcast.

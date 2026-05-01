@@ -19,8 +19,8 @@ use crate::config::AssetPolicyConfig;
 use crate::kms::{AgentKms, KmsError, AUDIT_LOG_PATH_ENV};
 use crate::lunes_client::{
     signed_extrinsic_payload_hash, LunesClient, LunesClientError, NativeBalance,
-    StakingRewardDestination, StakingRewardDestinationKind, DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS,
-    MAX_ARCHIVE_TX_LOOKBACK_BLOCKS,
+    StakingRewardDestination, StakingRewardDestinationKind, ValidatorProfile,
+    DEFAULT_ARCHIVE_TX_LOOKBACK_BLOCKS, MAX_ARCHIVE_TX_LOOKBACK_BLOCKS,
 };
 
 const LUNES_DECIMALS: u32 = 8;
@@ -139,6 +139,7 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         | "lunes_get_investment_position"
         | "lunes_get_validator_set"
         | "lunes_get_validator_profiles"
+        | "lunes_get_validator_scores"
         | "lunes_get_staking_overview"
         | "lunes_get_staking_account"
         | "lunes_get_governance_overview"
@@ -154,8 +155,10 @@ pub fn dispatch_tool_call(request: &ToolCallRequest, kms: &AgentKms) -> McpToolR
         "lunes_call_contract" => handle_call_contract(&request.arguments, kms),
         "lunes_stake_bond" => handle_stake_bond(&request.arguments, kms),
         "lunes_stake_unbond" => handle_stake_unbond(&request.arguments, kms),
+        "lunes_stake_rebond" => handle_stake_rebond(&request.arguments, kms),
         "lunes_stake_withdraw_unbonded" => handle_stake_withdraw_unbonded(&request.arguments, kms),
         "lunes_stake_nominate" => handle_stake_nominate(&request.arguments, kms),
+        "lunes_stake_payout" => handle_stake_payout(&request.arguments, kms),
         "lunes_stake_chill" => handle_stake_chill(kms),
         "lunes_stake_set_payee" => handle_stake_set_payee(&request.arguments, kms),
         "lunes_prepare_governance_vote" => handle_prepare_governance_vote(&request.arguments, kms),
@@ -195,6 +198,9 @@ pub async fn dispatch_tool_call_with_chain(
         }
         "lunes_get_validator_profiles" => {
             handle_get_validator_profiles(&request.arguments, lunes_client).await
+        }
+        "lunes_get_validator_scores" => {
+            handle_get_validator_scores(&request.arguments, lunes_client).await
         }
         "lunes_get_staking_overview" => {
             handle_get_staking_overview(&request.arguments, kms, lunes_client).await
@@ -343,6 +349,28 @@ pub fn tool_definitions() -> Vec<Value> {
                         "minimum": 1,
                         "maximum": MAX_VALIDATOR_LIMIT,
                         "description": "Maximum validators to profile when validators is omitted. Defaults to 16."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_get_validator_scores",
+            "description": "Score validators from observable live profile data. Exposure and reward history are reported as not decoded unless available in future versions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "validators": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_VALIDATOR_LIMIT,
+                        "items": { "type": "string" },
+                        "description": "Optional validator addresses. If omitted, the tool samples the active validator set."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_VALIDATOR_LIMIT,
+                        "description": "Maximum validators to score when validators is omitted. Defaults to 16."
                     }
                 }
             }
@@ -588,6 +616,17 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "lunes_stake_rebond",
+            "description": "Prepare or sign a Lunes staking rebond operation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount": { "type": "integer", "minimum": 1, "description": "LUNES amount to rebond." }
+                },
+                "required": ["amount"]
+            }
+        }),
+        serde_json::json!({
             "name": "lunes_stake_withdraw_unbonded",
             "description": "Prepare or sign withdrawal of unlocked staking funds.",
             "inputSchema": {
@@ -595,6 +634,18 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "slashing_spans": { "type": "integer", "minimum": 0, "description": "Slashing spans count. Defaults to 0." }
                 }
+            }
+        }),
+        serde_json::json!({
+            "name": "lunes_stake_payout",
+            "description": "Prepare or sign payout_stakers for a specific validator stash and era.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "validator_stash": { "type": "string", "description": "Validator stash SS58 address. Must be whitelisted." },
+                    "era": { "type": "integer", "minimum": 0, "description": "Staking era to pay out." }
+                },
+                "required": ["validator_stash", "era"]
             }
         }),
         serde_json::json!({
@@ -1001,38 +1052,14 @@ async fn handle_get_validator_set(args: &Value, lunes_client: &LunesClient) -> M
 }
 
 async fn handle_get_validator_profiles(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
-    let limit = match validator_limit_arg(args, "limit") {
-        Ok(limit) => limit,
+    let validators = match validator_addresses_from_args(args, lunes_client).await {
+        Ok(validators) => validators,
         Err(error) => return error,
     };
-    let validators = match optional_string_array(args, "validators") {
-        Ok(Some(validators)) => {
-            if validators.is_empty() {
-                return McpToolResult::error(-32001, "validators must not be empty".into());
-            }
-            if validators.len() > MAX_VALIDATOR_LIMIT {
-                return McpToolResult::error(
-                    -32001,
-                    format!("validators exceeds maximum of {MAX_VALIDATOR_LIMIT}"),
-                );
-            }
-            validators
-        }
-        Ok(None) => match lunes_client.validator_set().await {
-            Ok(validator_set) => validator_set.validators.into_iter().take(limit).collect(),
-            Err(error) => return McpToolResult::error(-32020, error.to_string()),
-        },
+    let parsed_validators = match parse_validator_addresses(&validators) {
+        Ok(parsed) => parsed,
         Err(error) => return error,
     };
-
-    let mut parsed_validators = Vec::with_capacity(validators.len());
-    for validator in &validators {
-        let parsed = match parse_lunes_address(validator, "validators") {
-            Ok(parsed) => parsed,
-            Err(error) => return error,
-        };
-        parsed_validators.push((validator.clone(), parsed.account_id));
-    }
 
     match lunes_client.validator_profiles(&parsed_validators).await {
         Ok(profiles) => {
@@ -1060,6 +1087,56 @@ async fn handle_get_validator_profiles(args: &Value, lunes_client: &LunesClient)
                     "Eligibility is a safety hint, not financial advice.",
                     "Agents should only nominate validators allowed by the configured whitelist.",
                     "Performance scoring and reward history remain future live reads."
+                ],
+            }))
+        }
+        Err(error) => McpToolResult::error(-32020, error.to_string()),
+    }
+}
+
+async fn handle_get_validator_scores(args: &Value, lunes_client: &LunesClient) -> McpToolResult {
+    let validators = match validator_addresses_from_args(args, lunes_client).await {
+        Ok(validators) => validators,
+        Err(error) => return error,
+    };
+    let parsed_validators = match parse_validator_addresses(&validators) {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+
+    match lunes_client.validator_profiles(&parsed_validators).await {
+        Ok(profiles) => {
+            let scores = profiles
+                .iter()
+                .map(validator_score_json)
+                .collect::<Vec<_>>();
+            McpToolResult::success(serde_json::json!({
+                "lookup": "live_lunes_rpc_validator_profile_storage",
+                "requested": validators.len(),
+                "returned": scores.len(),
+                "score_model": {
+                    "name": "observable_validator_safety_score_v1",
+                    "max_score": 100,
+                    "confidence": "partial",
+                    "inputs": [
+                        "active_session_validator",
+                        "commission_perbill",
+                        "blocked",
+                        "eligible_for_nomination",
+                        "nomination_warnings"
+                    ],
+                    "not_decoded": [
+                        "validator_exposure",
+                        "reward_payout_history",
+                        "era_points",
+                        "slashing_history"
+                    ]
+                },
+                "scores": scores,
+                "risk_notes": [
+                    "Score is a bounded safety heuristic, not financial advice.",
+                    "Exposure and performance history are not decoded by this MCP yet.",
+                    "Agents must still use configured validator whitelists for nomination writes."
                 ],
             }))
         }
@@ -1876,6 +1953,100 @@ fn governance_limit_arg(args: &Value, field_name: &str) -> Result<usize, McpTool
     Ok(limit as usize)
 }
 
+async fn validator_addresses_from_args(
+    args: &Value,
+    lunes_client: &LunesClient,
+) -> Result<Vec<String>, McpToolResult> {
+    let limit = validator_limit_arg(args, "limit")?;
+    match optional_string_array(args, "validators") {
+        Ok(Some(validators)) => {
+            if validators.is_empty() {
+                return Err(McpToolResult::error(
+                    -32001,
+                    "validators must not be empty".into(),
+                ));
+            }
+            if validators.len() > MAX_VALIDATOR_LIMIT {
+                return Err(McpToolResult::error(
+                    -32001,
+                    format!("validators exceeds maximum of {MAX_VALIDATOR_LIMIT}"),
+                ));
+            }
+            Ok(validators)
+        }
+        Ok(None) => lunes_client
+            .validator_set()
+            .await
+            .map(|validator_set| validator_set.validators.into_iter().take(limit).collect())
+            .map_err(|error| McpToolResult::error(-32020, error.to_string())),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_validator_addresses(
+    validators: &[String],
+) -> Result<Vec<(String, [u8; 32])>, McpToolResult> {
+    let mut parsed_validators = Vec::with_capacity(validators.len());
+    for validator in validators {
+        let parsed = parse_lunes_address(validator, "validators")?;
+        parsed_validators.push((validator.clone(), parsed.account_id));
+    }
+    Ok(parsed_validators)
+}
+
+fn validator_score_json(profile: &ValidatorProfile) -> Value {
+    let commission_score = validator_commission_score(profile.commission_perbill);
+    let activity_score = if profile.active_session_validator {
+        30
+    } else {
+        0
+    };
+    let eligibility_score = if profile.eligible_for_nomination {
+        25
+    } else {
+        0
+    };
+    let not_blocked_score = if profile.blocked { 0 } else { 10 };
+    let score = commission_score + activity_score + eligibility_score + not_blocked_score;
+
+    serde_json::json!({
+        "address": profile.address,
+        "score": score,
+        "score_confidence": "partial",
+        "components": {
+            "commission_score": commission_score,
+            "activity_score": activity_score,
+            "eligibility_score": eligibility_score,
+            "not_blocked_score": not_blocked_score,
+            "exposure_score": null,
+        },
+        "observed": {
+            "active_session_validator": profile.active_session_validator,
+            "commission_perbill": profile.commission_perbill,
+            "commission_percent": profile.commission_percent,
+            "blocked": profile.blocked,
+            "eligible_for_nomination": profile.eligible_for_nomination,
+        },
+        "exposure": {
+            "decoded": false,
+            "score": null,
+            "reason": "validator exposure is not decoded by this MCP yet"
+        },
+        "risk_flags": profile.nomination_warnings,
+    })
+}
+
+fn validator_commission_score(commission_perbill: Option<u32>) -> u64 {
+    const MAX_SCORE: u64 = 35;
+    const ZERO_SCORE_AT_PERBILL: u64 = 200_000_000;
+
+    let Some(commission_perbill) = commission_perbill else {
+        return 0;
+    };
+    let commission = u64::from(commission_perbill).min(ZERO_SCORE_AT_PERBILL);
+    MAX_SCORE.saturating_sub((commission * MAX_SCORE) / ZERO_SCORE_AT_PERBILL)
+}
+
 fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
     let permissions = kms.permissions();
     let is_autonomous = kms.is_autonomous();
@@ -2499,6 +2670,25 @@ fn handle_stake_unbond(args: &Value, kms: &AgentKms) -> McpToolResult {
     )
 }
 
+fn handle_stake_rebond(args: &Value, kms: &AgentKms) -> McpToolResult {
+    let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    if amount == 0 {
+        return McpToolResult::error(-32001, "Missing or zero required field: amount".into());
+    }
+
+    let payload = format!("staking.rebond({amount})");
+    execute_staking_operation(
+        kms,
+        "staking.rebond",
+        amount,
+        &payload,
+        serde_json::json!({
+            "action": "staking.rebond",
+            "amount_lunes": amount,
+        }),
+    )
+}
+
 fn handle_stake_withdraw_unbonded(args: &Value, kms: &AgentKms) -> McpToolResult {
     let slashing_spans = args
         .get("slashing_spans")
@@ -2552,6 +2742,40 @@ fn handle_stake_nominate(args: &Value, kms: &AgentKms) -> McpToolResult {
         serde_json::json!({
             "action": "staking.nominate",
             "validators": validators,
+        }),
+    )
+}
+
+fn handle_stake_payout(args: &Value, kms: &AgentKms) -> McpToolResult {
+    let validator_stash = args
+        .get("validator_stash")
+        .or_else(|| args.get("validator"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if let Err(error) = validate_address(validator_stash, "validator_stash") {
+        return error;
+    }
+    if let Some(error) =
+        validate_extra_whitelisted_destinations(kms, &[validator_stash.to_string()])
+    {
+        return error;
+    }
+
+    let era = match staking_era_arg(args) {
+        Ok(era) => era,
+        Err(error) => return error,
+    };
+
+    let payload = format!("staking.payout_stakers({validator_stash},{era})");
+    execute_staking_operation(
+        kms,
+        "staking.payout_stakers",
+        0,
+        &payload,
+        serde_json::json!({
+            "action": "staking.payout_stakers",
+            "validator_stash": validator_stash,
+            "era": era,
         }),
     )
 }
@@ -2926,6 +3150,17 @@ fn reward_destination_from_args(
     })
 }
 
+fn staking_era_arg(args: &Value) -> Result<u32, McpToolResult> {
+    let Some(era) = args.get("era").and_then(|value| value.as_u64()) else {
+        return Err(McpToolResult::error(
+            -32001,
+            "Missing required field: era".into(),
+        ));
+    };
+    u32::try_from(era)
+        .map_err(|_| McpToolResult::error(-32001, "era exceeds the supported range".into()))
+}
+
 fn string_array(args: &Value, field_name: &str) -> Result<Vec<String>, McpToolResult> {
     let values = args
         .get(field_name)
@@ -3100,8 +3335,10 @@ mod tests {
             allowed_extrinsics: vec![
                 "staking.bond".into(),
                 "staking.unbond".into(),
+                "staking.rebond".into(),
                 "staking.withdraw_unbonded".into(),
                 "staking.nominate".into(),
+                "staking.payout_stakers".into(),
                 "staking.chill".into(),
                 "staking.set_payee".into(),
             ],
@@ -3621,6 +3858,59 @@ mod tests {
         assert_eq!(data["summary"]["blocked"], 1);
         assert_eq!(data["profiles"][0]["commission_percent"], "10.0000");
         assert_eq!(data["profiles"][1]["eligible_for_nomination"], false);
+    }
+
+    #[tokio::test]
+    async fn get_validator_scores_returns_partial_observable_score() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, permissions());
+        let first = lunes_address(8);
+        let second = lunes_address(9);
+        let client = LunesClient::static_validator_profiles(vec![
+            ValidatorProfile {
+                address: first.clone(),
+                active_session_validator: true,
+                commission_perbill: Some(10_000_000),
+                commission_percent: Some("1.0000".into()),
+                blocked: false,
+                eligible_for_nomination: true,
+                nomination_warnings: vec![],
+                lookup: "live_lunes_rpc_validator_profile_storage".into(),
+            },
+            ValidatorProfile {
+                address: second.clone(),
+                active_session_validator: false,
+                commission_perbill: Some(200_000_000),
+                commission_percent: Some("20.0000".into()),
+                blocked: true,
+                eligible_for_nomination: false,
+                nomination_warnings: vec!["not_in_active_validator_set".into()],
+                lookup: "live_lunes_rpc_validator_profile_storage".into(),
+            },
+        ]);
+
+        let response = dispatch_tool_call_with_chain(
+            &ToolCallRequest {
+                name: "lunes_get_validator_scores".into(),
+                arguments: serde_json::json!({ "validators": [first, second] }),
+            },
+            &kms,
+            &client,
+        )
+        .await;
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["scores"][0]["address"], first);
+        assert_eq!(data["scores"][0]["exposure"]["decoded"], false);
+        assert_eq!(data["scores"][0]["score_confidence"], "partial");
+        assert!(
+            data["scores"][0]["score"].as_u64().unwrap()
+                > data["scores"][1]["score"].as_u64().unwrap()
+        );
+        assert_eq!(
+            data["scores"][1]["risk_flags"][0],
+            "not_in_active_validator_set"
+        );
     }
 
     #[tokio::test]
@@ -4933,7 +5223,7 @@ mod tests {
     #[test]
     fn tools_list_includes_all_schemas() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 35);
+        assert_eq!(tools.len(), 38);
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_balance"));
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_get_assets"));
         assert!(tools
@@ -4954,6 +5244,9 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_validator_profiles"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_get_validator_scores"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_get_staking_overview"));
@@ -4995,6 +5288,12 @@ mod tests {
             .iter()
             .any(|tool| tool["name"] == "lunes_read_contract"));
         assert!(tools.iter().any(|tool| tool["name"] == "lunes_stake_bond"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_stake_rebond"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "lunes_stake_payout"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "lunes_stake_nominate"));
@@ -5083,6 +5382,81 @@ mod tests {
         assert_eq!(data["action"], "staking.unbond");
         assert_eq!(data["broadcasted"], false);
         assert!(data["signature"].is_string());
+    }
+
+    #[test]
+    fn staking_rebond_prepares_human_review_payload() {
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_rebond".into(),
+                arguments: serde_json::json!({
+                    "amount": 25
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["data"]["action"], "staking.rebond");
+        assert_eq!(data["data"]["amount_lunes"], 25);
+        assert_eq!(data["data"]["broadcasted"], false);
+    }
+
+    #[test]
+    fn staking_payout_requires_validator_whitelist() {
+        let validator = lunes_address(8);
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["staking.payout_stakers".into()],
+                whitelisted_addresses: vec!["staking".into()],
+                daily_limit_lunes: 1_000,
+                allowlist_contracts: Default::default(),
+                asset_policies: Default::default(),
+                governance: Default::default(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_payout".into(),
+                arguments: serde_json::json!({
+                    "validator_stash": validator,
+                    "era": 42
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("not in the whitelist"));
+    }
+
+    #[test]
+    fn staking_payout_prepares_when_validator_whitelisted() {
+        let validator = lunes_address(8);
+        let kms = AgentKms::new(AgentMode::PrepareOnly, staking_permissions());
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_stake_payout".into(),
+                arguments: serde_json::json!({
+                    "validator_stash": validator,
+                    "era": 42
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["data"]["action"], "staking.payout_stakers");
+        assert_eq!(data["data"]["era"], 42);
+        assert_eq!(data["data"]["broadcasted"], false);
     }
 
     #[test]
