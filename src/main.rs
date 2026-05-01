@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     module.register_method("mcp_status", |_, ctx, _| {
+        let transport = ctx.transport_security.metrics();
         serde_json::json!({
             "server": "lunes-mcp-server",
             "version": env!("CARGO_PKG_VERSION"),
@@ -250,7 +251,8 @@ async fn main() -> anyhow::Result<()> {
                 "max_request_body_bytes": MAX_REQUEST_BODY_BYTES,
                 "max_response_body_bytes": MAX_RESPONSE_BODY_BYTES,
                 "max_connections": MAX_CONNECTIONS,
-            }
+            },
+            "transport_metrics": transport,
         })
     })?;
 

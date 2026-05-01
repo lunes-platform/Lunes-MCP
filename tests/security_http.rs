@@ -76,6 +76,20 @@ fn accepts_request_with_bearer_api_key() {
 }
 
 #[test]
+fn status_reports_transport_metrics() {
+    let server = RunningServer::start(Some("test-token"), 10, 20);
+
+    let response = post_json_rpc(
+        &server.addr,
+        Some("Bearer test-token"),
+        r#"{"jsonrpc":"2.0","id":1,"method":"mcp_status","params":{}}"#,
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains(r#""transport_metrics":{"accepted_requests":"#));
+}
+
+#[test]
 fn tools_list_exposes_block_history_tools() {
     let server = RunningServer::start(Some("test-token"), 10, 20);
 
