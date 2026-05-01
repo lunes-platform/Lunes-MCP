@@ -49,6 +49,16 @@ daily_limit_lunes = 0
 # Example: { "6contract..." = ["PSP22::balance_of"] }
 allowlist_contracts = {}
 
+# Optional PSP22 metadata and transfer policy, keyed by contract address.
+# PSP22 transfers require a contract/message allowlist plus this asset policy.
+# Example:
+# [agent.permissions.asset_policies."6contract..."]
+# name = "Example Token"
+# symbol = "EXT"
+# decimals = 12
+# max_transfer_base_units = "1000000000000"
+# allowed_recipients = ["5recipient..."]
+
 # Agent key lifetime in hours. Zero disables expiration.
 ttl_hours = 168
 

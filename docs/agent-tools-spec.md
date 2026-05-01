@@ -52,7 +52,7 @@ curl -s http://127.0.0.1:9964 \
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `lunes_get_assets` | Read | List native LUNES and PSP22 contracts exposed by the active agent policy |
+| `lunes_get_assets` | Read | List native LUNES and PSP22 contracts, local metadata, and transfer limits exposed by the active agent policy |
 | `lunes_get_asset_balance` | Read | Read native LUNES or dry-run PSP22 balance reads for allowlisted token contracts |
 | `lunes_get_network_health` | Read | Inspect live peer count, sync status, best/finalized blocks, pending pool size, and RPC surface size |
 | `lunes_get_account_overview` | Read | Inspect account nonce, native LUNES balances, spendable amount, and active agent policy |
@@ -68,6 +68,8 @@ curl -s http://127.0.0.1:9964 \
 | `lunes_search_account_activity` | Read | Search pending transactions and recent finalized blocks for bounded account activity timelines |
 | `lunes_submit_signed_extrinsic` | Write | Relay an externally signed Lunes transaction payload, then poll for inclusion/finality |
 | `lunes_transfer_native` | Write | Prepare, locally sign, or guarded-broadcast a native LUNES transfer |
+| `lunes_transfer_psp22` | Write | Prepare or locally sign a PSP22 transfer after contract/message, recipient, and asset-limit checks |
+| `lunes_call_contract` | Write | Prepare generic contract calls; autonomous generic signing is disabled |
 | `lunes_prepare_governance_vote` | Prepare | Prepare a human-review governance vote payload without signing or broadcasting |
 | `lunes_prepare_governance_remove_vote` | Prepare | Prepare a human-review remove-vote payload without signing or broadcasting |
 | `lunes_read_contract` | Read | Simulate an allowed read-only Lunes contract call through live RPC |
@@ -118,12 +120,15 @@ Always:
 - validate SS58 addresses before account-specific reads;
 - keep read-only tools free of signing or budget mutation;
 - require contract/message allowlists before PSP22 balance dry-runs;
+- require PSP22 asset policies with local metadata, `max_transfer_base_units`,
+  and `allowed_recipients` before PSP22 transfer signing;
 - require contract/message allowlists before contract write preparation;
 - cap user-controlled limits such as validator list size and archive lookup
   depth;
 - keep block history tools bounded and avoid returning raw extrinsics from block
   summary responses;
-- keep write tools behind allowlists, TTL, and daily spend limits;
+- keep write tools behind allowlists, TTL, daily native spend limits, and
+  asset-specific PSP22 transfer limits;
 - keep governance tools behind dedicated prepare-only policy fields and reject
   `confirm_broadcast=true`;
 - never sign governance payloads with the local KMS, even in autonomous mode;
@@ -143,7 +148,7 @@ Ask first:
 - adding dependencies;
 - changing public tool names or response fields;
 - enabling additional internal final Lunes Network transaction categories such
-  as staking, PSP22, contracts, or governance;
+  as staking, generic contracts, or governance;
 - expanding staking reads into reward payout history, performance scoring, or
   automated validator selection.
 
@@ -162,7 +167,8 @@ Never:
 - `lunes_get_network_health` reads live Lunes Network status.
 - `lunes_get_account_overview` returns balance and nonce for a valid Lunes
   address.
-- `lunes_get_assets` exposes only native LUNES plus contracts from local policy.
+- `lunes_get_assets` exposes only native LUNES plus contracts from local policy,
+  including configured PSP22 metadata and transfer limits.
 - `lunes_get_asset_balance` rejects non-allowlisted PSP22 contracts and returns
   raw live dry-run results for allowed token balances.
 - `lunes_get_investment_position` gives agents a conservative liquidity and
@@ -195,5 +201,8 @@ Never:
   them.
 - `lunes_transfer_native` preserves prepare/local-intent responses by default
   and only broadcasts when every internal-signing guardrail passes.
+- `lunes_transfer_psp22` rejects transfers without contract/message allowlists,
+  an asset-specific base-unit limit, and an allowed recipient; it does not
+  consume the native LUNES daily budget for token amounts.
 - `lunes_read_contract` requires contract message allowlists before live reads.
 - All verification commands pass before publishing.

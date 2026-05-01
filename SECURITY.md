@@ -45,14 +45,14 @@ The `.gitignore` blocks these patterns by default.
 ## Current Security Limitations
 
 - Lunes Network metadata, health, native balances, allowlisted PSP22 balance dry-runs, account nonce, validator set, validator profiles, account staking state, bounded account activity scans, recent block summaries, raw block event lookup, bounded raw governance referendum reads, read-only contract simulation, externally signed extrinsic submission, guarded native LUNES transfer submission, and bounded archive-assisted transaction lookup use live RPC.
-- PSP22 decoded balance values, token metadata discovery, governance metadata decoding, account voting history, performance scoring, indexed full-history transaction search, and KMS-built staking/contract/governance transaction signing still need full network-backed implementations.
+- PSP22 decoded balance values, automatic token metadata discovery, governance metadata decoding, account voting history, performance scoring, indexed full-history transaction search, and KMS-built staking/generic-contract/governance transaction signing still need full network-backed implementations.
 - Recent block summaries intentionally omit raw extrinsics; account activity timelines use raw account-id substring matching and can miss encoded relationships that require a full indexer or metadata-aware decoding.
 - Staking write tools prepare or locally sign intent payloads only; validator and reward-account choices must be explicitly whitelisted.
 - Governance preparation requires a dedicated referendum/direction/conviction/amount policy and never signs locally, even when autonomous mode is active.
 - SS58 validation checks the Lunes Network prefix and checksum, but it does not prove account ownership.
 - Autonomous signatures are local intent payload signatures except for guarded native LUNES transfer broadcast, which builds and signs a final network transaction only after all internal signing guardrails pass.
 - Raw signed extrinsic submission still does not decode transaction contents before broadcast; it is hash-preapproved and policy-gated to prevent arbitrary relay, but only enable it in an operator-controlled environment.
-- Read-only contract simulation and contract write preparation require explicit message allowlists; autonomous `contracts.call` writes remain disabled until asset-specific limits exist.
+- Read-only contract simulation and contract write preparation require explicit message allowlists. PSP22 transfer signing additionally requires local asset metadata, `max_transfer_base_units`, and `allowed_recipients`; autonomous generic `contracts.call` signing is blocked.
 - Audit logs are bounded in memory by default. Set `LUNES_MCP_AUDIT_LOG_PATH` to append JSONL entries with action metadata and payload hashes for persistent retention; successful local KMS signing fails closed if that persistent write fails.
 - Runtime config rejects public `ws://` RPC URLs and RPC URLs containing credentials, query strings, or fragments; use `wss://` for non-local endpoints.
 

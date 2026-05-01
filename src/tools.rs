@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::abi_registry::AbiRegistry;
 use crate::address::{validate_lunes_address, LunesAddress, LUNES_SS58_PREFIX};
+use crate::config::AssetPolicyConfig;
 use crate::kms::{AgentKms, KmsError, AUDIT_LOG_PATH_ENV};
 use crate::lunes_client::{
     signed_extrinsic_payload_hash, LunesClient, LunesClientError, NativeBalance,
@@ -542,9 +543,10 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "contract_address": { "type": "string", "description": "PSP22 contract SS58 address." },
                     "to": { "type": "string", "description": "Recipient SS58 address." },
-                    "amount": { "type": "integer", "minimum": 1, "description": "Token amount." }
+                    "amount": { "type": "integer", "minimum": 1, "description": "Token base-unit amount." },
+                    "amount_base_units": { "type": "string", "description": "Exact token base-unit amount. Must match amount when both are provided." }
                 },
-                "required": ["contract_address", "to", "amount"]
+                "required": ["contract_address", "to"]
             }
         }),
         serde_json::json!({
@@ -723,21 +725,54 @@ async fn handle_get_balance(
 }
 
 fn handle_get_assets(kms: &AgentKms) -> McpToolResult {
-    let mut contract_assets: Vec<_> = kms
-        .permissions()
+    let permissions = kms.permissions();
+    let mut contract_addresses: Vec<String> = permissions
         .allowlist_contracts
         .iter()
         .filter(|(_, methods)| {
             methods
                 .iter()
-                .any(|method| is_psp22_balance_method(method.as_str()))
+                .any(|method| is_psp22_asset_method(method.as_str()))
         })
-        .map(|(contract_address, methods)| {
+        .map(|(contract_address, _)| contract_address.clone())
+        .collect();
+    for contract_address in permissions.asset_policies.keys() {
+        if !contract_addresses
+            .iter()
+            .any(|existing| existing == contract_address)
+        {
+            contract_addresses.push(contract_address.clone());
+        }
+    }
+
+    let mut contract_assets: Vec<_> = contract_addresses
+        .into_iter()
+        .map(|contract_address| {
+            let methods = permissions
+                .allowlist_contracts
+                .get(&contract_address)
+                .cloned()
+                .unwrap_or_default();
+            let read_methods_allowed: Vec<_> = methods
+                .iter()
+                .filter(|method| is_psp22_balance_method(method.as_str()))
+                .cloned()
+                .collect();
+            let transfer_methods_allowed: Vec<_> = methods
+                .iter()
+                .filter(|method| is_psp22_transfer_method(method.as_str()))
+                .cloned()
+                .collect();
+            let policy = permissions.asset_policies.get(&contract_address);
             serde_json::json!({
                 "type": "psp22",
                 "contract_address": contract_address,
                 "interface": "PSP22",
-                "read_methods_allowed": methods,
+                "metadata": psp22_asset_metadata_json(policy),
+                "methods_allowed": methods,
+                "read_methods_allowed": read_methods_allowed,
+                "transfer_methods_allowed": transfer_methods_allowed,
+                "transfer_policy": psp22_transfer_policy_json(policy),
                 "balance_lookup": "contracts_call_dry_run",
                 "decoded": false,
             })
@@ -757,7 +792,8 @@ fn handle_get_assets(kms: &AgentKms) -> McpToolResult {
         "policy": {
             "psp22_balance_requires_contract_allowlist": true,
             "native_daily_limit_lunes": kms.permissions().daily_limit_lunes,
-            "asset_specific_transfer_limits": false,
+            "asset_specific_transfer_limits": true,
+            "psp22_transfer_requires_asset_policy": true,
         },
         "lookup": "local_agent_policy",
     }))
@@ -1623,12 +1659,62 @@ fn native_asset_json() -> Value {
     })
 }
 
+fn psp22_asset_metadata_json(policy: Option<&AssetPolicyConfig>) -> Value {
+    serde_json::json!({
+        "name": policy.and_then(|policy| policy.name.as_deref()),
+        "symbol": policy.and_then(|policy| policy.symbol.as_deref()),
+        "decimals": policy.and_then(|policy| policy.decimals),
+        "source": if policy.is_some() { "local_agent_policy" } else { "not_configured" },
+        "live_decoded": false,
+    })
+}
+
+fn psp22_transfer_policy_json(policy: Option<&AssetPolicyConfig>) -> Value {
+    let allowed_recipients = policy
+        .map(|policy| policy.allowed_recipients.clone())
+        .unwrap_or_default();
+    let allowed_recipients_count = allowed_recipients.len();
+    serde_json::json!({
+        "has_asset_specific_limit": policy
+            .and_then(|policy| policy.max_transfer_base_units.as_deref())
+            .is_some(),
+        "max_transfer_base_units": policy.and_then(|policy| policy.max_transfer_base_units.as_deref()),
+        "allowed_recipients": allowed_recipients,
+        "allowed_recipients_count": allowed_recipients_count,
+    })
+}
+
+fn configured_asset_policies_json(kms: &AgentKms) -> Vec<Value> {
+    let mut policies: Vec<_> = kms
+        .permissions()
+        .asset_policies
+        .iter()
+        .map(|(contract_address, policy)| {
+            serde_json::json!({
+                "contract_address": contract_address,
+                "metadata": psp22_asset_metadata_json(Some(policy)),
+                "transfer_policy": psp22_transfer_policy_json(Some(policy)),
+            })
+        })
+        .collect();
+    policies.sort_by(|left, right| {
+        left["contract_address"]
+            .as_str()
+            .cmp(&right["contract_address"].as_str())
+    });
+    policies
+}
+
 fn is_native_asset_id(asset_id: &str) -> bool {
     asset_id.eq_ignore_ascii_case("native") || asset_id.eq_ignore_ascii_case("lunes")
 }
 
 fn is_psp22_balance_method(method: &str) -> bool {
     method == "PSP22::balance_of" || method == "balance_of"
+}
+
+fn is_psp22_asset_method(method: &str) -> bool {
+    is_psp22_balance_method(method) || is_psp22_transfer_method(method)
 }
 
 fn validate_psp22_balance_read(kms: &AgentKms, contract_address: &str) -> Result<(), KmsError> {
@@ -1639,6 +1725,10 @@ fn validate_psp22_balance_read(kms: &AgentKms, contract_address: &str) -> Result
 fn validate_psp22_transfer(kms: &AgentKms, contract_address: &str) -> Result<(), KmsError> {
     kms.validate_contract_call(contract_address, "PSP22::transfer")
         .or_else(|_| kms.validate_contract_call(contract_address, "transfer"))
+}
+
+fn is_psp22_transfer_method(method: &str) -> bool {
+    method == "PSP22::transfer" || method == "transfer"
 }
 
 fn native_balance_json(balance: NativeBalance) -> Value {
@@ -1735,6 +1825,7 @@ fn agent_policy_json(kms: &AgentKms) -> Value {
         "spent_today_lunes": kms.spent_today(),
         "remaining_today_lunes": permissions.daily_limit_lunes.saturating_sub(kms.spent_today()),
         "ttl_hours": permissions.ttl_hours,
+        "asset_policies": configured_asset_policies_json(kms),
         "governance": governance_policy_json(kms),
     })
 }
@@ -1821,6 +1912,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "spent_today_lunes": kms.spent_today(),
             "remaining_today_lunes": permissions.daily_limit_lunes.saturating_sub(kms.spent_today()),
             "ttl_hours": permissions.ttl_hours,
+            "asset_policies": configured_asset_policies_json(kms),
             "governance": governance_policy_json(kms),
         },
         "guardrails": [
@@ -1829,6 +1921,7 @@ fn handle_get_permissions(kms: &AgentKms) -> McpToolResult {
             "empty destination whitelist blocks all write destinations",
             "staking tools require the staking policy target plus validator or reward accounts in the whitelist",
             "contract calls require explicit contract and message allowlists",
+            "PSP22 transfers require an asset policy with max_transfer_base_units and allowed_recipients",
             "governance tools are read/prepare-only and never sign or broadcast final votes",
             "broadcast to Lunes Network requires local opt-in, caller confirmation, and a pre-approved signed extrinsic hash"
         ],
@@ -2098,6 +2191,120 @@ fn amount_lunes_for_policy(amount_base_units: u128) -> Result<u64, McpToolResult
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Psp22TransferAmount {
+    base_units: u128,
+}
+
+fn psp22_transfer_amount_from_args(args: &Value) -> Result<Psp22TransferAmount, McpToolResult> {
+    let amount = args.get("amount").and_then(|value| value.as_u64());
+    let amount_base_units = optional_u128_arg(args, "amount_base_units")?;
+
+    match (amount, amount_base_units) {
+        (Some(0), _) => Err(McpToolResult::error(
+            -32001,
+            "Missing or zero required field: amount".into(),
+        )),
+        (Some(amount), maybe_base_units) => {
+            let amount = amount as u128;
+            if let Some(provided_base_units) = maybe_base_units {
+                if provided_base_units != amount {
+                    return Err(McpToolResult::error(
+                        -32001,
+                        "amount_base_units must match amount when both are provided".into(),
+                    ));
+                }
+            }
+            Ok(Psp22TransferAmount { base_units: amount })
+        }
+        (None, Some(amount_base_units)) if amount_base_units > 0 => Ok(Psp22TransferAmount {
+            base_units: amount_base_units,
+        }),
+        _ => Err(McpToolResult::error(
+            -32001,
+            "Missing required field: amount or amount_base_units".into(),
+        )),
+    }
+}
+
+fn validate_psp22_asset_transfer_policy<'a>(
+    kms: &'a AgentKms,
+    contract: &str,
+    to: &str,
+    amount: Psp22TransferAmount,
+) -> Result<&'a AssetPolicyConfig, McpToolResult> {
+    let policy = kms
+        .permissions()
+        .asset_policies
+        .get(contract)
+        .ok_or_else(|| {
+            McpToolResult::error(
+                -32011,
+                format!(
+                    "PSP22 contract '{contract}' requires an asset-specific transfer limit in agent.permissions.asset_policies"
+                ),
+            )
+        })?;
+
+    let max_transfer = policy
+        .max_transfer_base_units
+        .as_deref()
+        .ok_or_else(|| {
+            McpToolResult::error(
+                -32011,
+                format!(
+                    "PSP22 contract '{contract}' requires max_transfer_base_units in its asset-specific transfer limit"
+                ),
+            )
+        })?
+        .parse::<u128>()
+        .map_err(|_| {
+            McpToolResult::error(
+                -32001,
+                format!(
+                    "PSP22 contract '{contract}' has invalid max_transfer_base_units in asset policy"
+                ),
+            )
+        })?;
+
+    if max_transfer == 0 {
+        return Err(McpToolResult::error(
+            -32011,
+            format!("PSP22 contract '{contract}' has a zero asset-specific transfer limit"),
+        ));
+    }
+
+    if amount.base_units > max_transfer {
+        return Err(McpToolResult::error(
+            -32010,
+            format!(
+                "PSP22 transfer amount {} exceeds asset-specific transfer limit {} for contract '{}'",
+                amount.base_units, max_transfer, contract
+            ),
+        ));
+    }
+
+    if policy.allowed_recipients.is_empty() {
+        return Err(McpToolResult::error(
+            -32011,
+            format!("PSP22 contract '{contract}' requires allowed_recipients in asset policy"),
+        ));
+    }
+
+    if !policy
+        .allowed_recipients
+        .iter()
+        .any(|allowed_recipient| allowed_recipient == to)
+    {
+        return Err(McpToolResult::error(
+            -32011,
+            format!("Recipient '{to}' is not allowlisted for PSP22 contract '{contract}'"),
+        ));
+    }
+
+    Ok(policy)
+}
+
 fn ed25519_signature_from_hex(signature: &str) -> Result<[u8; 64], LunesClientError> {
     let bytes = hex::decode(signature).map_err(|error| {
         LunesClientError::TransactionSubmission(format!("invalid KMS signature hex: {error}"))
@@ -2116,7 +2323,10 @@ fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
-    let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    let amount = match psp22_transfer_amount_from_args(args) {
+        Ok(amount) => amount,
+        Err(error) => return error,
+    };
 
     if let Err(e) = validate_address(contract, "contract_address") {
         return e;
@@ -2124,28 +2334,36 @@ fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
     if let Err(e) = validate_address(to, "to") {
         return e;
     }
-    if amount == 0 {
-        return McpToolResult::error(-32001, "Missing or zero required field: amount".into());
-    }
 
     if let Err(error) = validate_psp22_transfer(kms, contract) {
         return McpToolResult::error(error.error_code(), error.to_string());
     }
+    let asset_policy = match validate_psp22_asset_transfer_policy(kms, contract, to, amount) {
+        Ok(policy) => policy,
+        Err(error) => return error,
+    };
 
-    let payload = format!("contracts.call({contract},PSP22::transfer,{to},{amount})");
+    let payload = format!(
+        "contracts.call({contract},PSP22::transfer,{to},{})",
+        amount.base_units
+    );
+    let asset_metadata = psp22_asset_metadata_json(Some(asset_policy));
+    let transfer_policy = psp22_transfer_policy_json(Some(asset_policy));
 
     execute_write_operation(
         kms,
         "contracts.call",
         contract,
-        amount,
+        0,
         &payload,
         |sig, pk| {
             serde_json::json!({
                 "action": "contracts.call (PSP22::transfer)",
                 "contract": contract,
                 "to": to,
-                "amount_tokens": amount,
+                "amount_base_units": amount.base_units.to_string(),
+                "asset_metadata": asset_metadata,
+                "transfer_policy": transfer_policy,
                 "signature": sig,
                 "signer": pk,
                 "broadcasted": false,
@@ -2157,7 +2375,9 @@ fn handle_transfer_psp22(args: &Value, kms: &AgentKms) -> McpToolResult {
             "action": "contracts.call (PSP22::transfer)",
             "contract": contract,
             "to": to,
-            "amount_tokens": amount,
+            "amount_base_units": amount.base_units.to_string(),
+            "asset_metadata": psp22_asset_metadata_json(Some(asset_policy)),
+            "transfer_policy": psp22_transfer_policy_json(Some(asset_policy)),
             "unsigned_payload": payload,
             "broadcasted": false,
             "next_step": "Human must review and sign this PSP22 transfer with an external wallet."
@@ -2178,6 +2398,17 @@ fn handle_call_contract(args: &Value, kms: &AgentKms) -> McpToolResult {
     }
     if message.is_empty() {
         return McpToolResult::error(-32001, "Missing required field: message".into());
+    }
+    if kms.is_autonomous() {
+        let guidance = if is_psp22_transfer_method(message) {
+            "use lunes_transfer_psp22 so asset-specific limits apply"
+        } else {
+            "use a specialized MCP tool with explicit policy checks"
+        };
+        return McpToolResult::error(
+            -32011,
+            format!("Autonomous generic contract calls are disabled; {guidance}."),
+        );
     }
     if let Err(error) = kms.validate_contract_call(contract, message) {
         return McpToolResult::error(error.error_code(), error.to_string());
@@ -2835,7 +3066,7 @@ async fn handle_read_contract(args: &Value, kms: &AgentKms, client: &LunesClient
 mod tests {
     use super::*;
     use crate::address::encode_lunes_address_for_tests;
-    use crate::config::{AgentMode, GovernancePolicyConfig, PermissionsConfig};
+    use crate::config::{AgentMode, AssetPolicyConfig, GovernancePolicyConfig, PermissionsConfig};
     use crate::lunes_client::{
         BlockEvents, BlockEventsLookup, BlockSummary, ChainInfo, ChainProperties,
         GovernanceReferenda, GovernanceReferendum, NativeBalance, NetworkHealth, Nominations,
@@ -2856,6 +3087,7 @@ mod tests {
             whitelisted_addresses: vec![lunes_address(1)],
             daily_limit_lunes: 100,
             allowlist_contracts: Default::default(),
+            asset_policies: Default::default(),
             governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
@@ -2876,6 +3108,7 @@ mod tests {
             whitelisted_addresses: vec!["staking".into(), lunes_address(8), lunes_address(9)],
             daily_limit_lunes: 1_000,
             allowlist_contracts: Default::default(),
+            asset_policies: Default::default(),
             governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
@@ -2889,6 +3122,7 @@ mod tests {
             whitelisted_addresses: vec![BROADCAST_POLICY_DESTINATION.into()],
             daily_limit_lunes: 1,
             allowlist_contracts: Default::default(),
+            asset_policies: Default::default(),
             governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
@@ -2905,6 +3139,7 @@ mod tests {
             whitelisted_addresses: vec![to.into(), BROADCAST_POLICY_DESTINATION.into()],
             daily_limit_lunes: 100,
             allowlist_contracts: Default::default(),
+            asset_policies: Default::default(),
             governance: Default::default(),
             ttl_hours: 168,
             human_approval_required: true,
@@ -2922,6 +3157,19 @@ mod tests {
                 max_vote_lunes: 50,
             },
             ..permissions()
+        }
+    }
+
+    fn psp22_asset_policy(
+        max_transfer_base_units: u128,
+        recipients: Vec<String>,
+    ) -> AssetPolicyConfig {
+        AssetPolicyConfig {
+            name: Some("Policy Token".into()),
+            symbol: Some("POL".into()),
+            decimals: Some(12),
+            max_transfer_base_units: Some(max_transfer_base_units.to_string()),
+            allowed_recipients: recipients,
         }
     }
 
@@ -3114,12 +3362,22 @@ mod tests {
     #[test]
     fn get_assets_lists_policy_allowed_contracts() {
         let contract = lunes_address(2);
+        let recipient = lunes_address(3);
         let mut allowlist_contracts = std::collections::HashMap::new();
-        allowlist_contracts.insert(contract.clone(), vec!["PSP22::balance_of".into()]);
+        allowlist_contracts.insert(
+            contract.clone(),
+            vec!["PSP22::balance_of".into(), "PSP22::transfer".into()],
+        );
+        let mut asset_policies = std::collections::HashMap::new();
+        asset_policies.insert(
+            contract.clone(),
+            psp22_asset_policy(1_000, vec![recipient.clone()]),
+        );
         let kms = AgentKms::new(
             AgentMode::PrepareOnly,
             PermissionsConfig {
                 allowlist_contracts,
+                asset_policies,
                 ..permissions()
             },
         );
@@ -3136,6 +3394,60 @@ mod tests {
         let data = response_json(&response);
         assert_eq!(data["assets"]["native"]["symbol"], "LUNES");
         assert_eq!(data["assets"]["contracts"][0]["contract_address"], contract);
+        assert_eq!(data["assets"]["contracts"][0]["metadata"]["symbol"], "POL");
+        assert_eq!(data["assets"]["contracts"][0]["metadata"]["decimals"], 12);
+        assert_eq!(
+            data["assets"]["contracts"][0]["read_methods_allowed"][0],
+            "PSP22::balance_of"
+        );
+        assert_eq!(
+            data["assets"]["contracts"][0]["transfer_methods_allowed"][0],
+            "PSP22::transfer"
+        );
+        assert_eq!(
+            data["assets"]["contracts"][0]["transfer_policy"]["max_transfer_base_units"],
+            "1000"
+        );
+        assert_eq!(
+            data["assets"]["contracts"][0]["transfer_policy"]["allowed_recipients"][0],
+            recipient
+        );
+        assert_eq!(data["policy"]["asset_specific_transfer_limits"], true);
+    }
+
+    #[test]
+    fn get_assets_lists_asset_policy_contracts_without_read_allowlist() {
+        let contract = lunes_address(2);
+        let recipient = lunes_address(3);
+        let mut asset_policies = std::collections::HashMap::new();
+        asset_policies.insert(contract.clone(), psp22_asset_policy(1_000, vec![recipient]));
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                asset_policies,
+                ..permissions()
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_get_assets".into(),
+                arguments: serde_json::json!({}),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["assets"]["contracts"][0]["contract_address"], contract);
+        assert_eq!(data["assets"]["contracts"][0]["metadata"]["symbol"], "POL");
+        assert_eq!(
+            data["assets"]["contracts"][0]["read_methods_allowed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -4274,7 +4586,7 @@ mod tests {
     }
 
     #[test]
-    fn psp22_transfer_consumes_daily_budget() {
+    fn psp22_transfer_requires_asset_specific_limit() {
         let contract = lunes_address(2);
         let to = lunes_address(3);
         let mut allowlist_contracts = std::collections::HashMap::new();
@@ -4284,8 +4596,9 @@ mod tests {
             PermissionsConfig {
                 allowed_extrinsics: vec!["contracts.call".into()],
                 whitelisted_addresses: vec![contract.clone()],
-                daily_limit_lunes: 5,
+                daily_limit_lunes: 100,
                 allowlist_contracts,
+                asset_policies: Default::default(),
                 governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
@@ -4307,7 +4620,163 @@ mod tests {
         );
 
         assert!(response.is_error);
-        assert!(response.content[0].text.contains("-32010"));
+        assert!(response.content[0]
+            .text
+            .contains("asset-specific transfer limit"));
+    }
+
+    #[test]
+    fn psp22_transfer_enforces_asset_specific_limit() {
+        let contract = lunes_address(2);
+        let to = lunes_address(3);
+        let mut allowlist_contracts = std::collections::HashMap::new();
+        allowlist_contracts.insert(contract.clone(), vec!["PSP22::transfer".into()]);
+        let mut asset_policies = std::collections::HashMap::new();
+        asset_policies.insert(contract.clone(), psp22_asset_policy(5, vec![to.clone()]));
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["contracts.call".into()],
+                whitelisted_addresses: vec![contract.clone()],
+                daily_limit_lunes: 100,
+                allowlist_contracts,
+                asset_policies,
+                governance: Default::default(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_transfer_psp22".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                    "to": to,
+                    "amount_base_units": "10"
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0]
+            .text
+            .contains("exceeds asset-specific transfer limit"));
+    }
+
+    #[test]
+    fn psp22_transfer_requires_asset_recipient_allowlist() {
+        let contract = lunes_address(2);
+        let to = lunes_address(3);
+        let other_recipient = lunes_address(4);
+        let mut allowlist_contracts = std::collections::HashMap::new();
+        allowlist_contracts.insert(contract.clone(), vec!["PSP22::transfer".into()]);
+        let mut asset_policies = std::collections::HashMap::new();
+        asset_policies.insert(
+            contract.clone(),
+            psp22_asset_policy(1_000, vec![other_recipient]),
+        );
+        let kms = AgentKms::new(
+            AgentMode::PrepareOnly,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["contracts.call".into()],
+                whitelisted_addresses: vec![contract.clone()],
+                daily_limit_lunes: 100,
+                allowlist_contracts,
+                asset_policies,
+                governance: Default::default(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
+            },
+        );
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_transfer_psp22".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                    "to": to,
+                    "amount_base_units": "10"
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("not allowlisted"));
+    }
+
+    #[test]
+    fn psp22_transfer_uses_asset_policy_without_consuming_native_budget() {
+        let contract = lunes_address(2);
+        let to = lunes_address(3);
+        let mut allowlist_contracts = std::collections::HashMap::new();
+        allowlist_contracts.insert(contract.clone(), vec!["PSP22::transfer".into()]);
+        let mut asset_policies = std::collections::HashMap::new();
+        asset_policies.insert(
+            contract.clone(),
+            psp22_asset_policy(1_000, vec![to.clone()]),
+        );
+        let kms = AgentKms::new(
+            AgentMode::Autonomous,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["contracts.call".into()],
+                whitelisted_addresses: vec![contract.clone()],
+                daily_limit_lunes: 0,
+                allowlist_contracts,
+                asset_policies,
+                governance: Default::default(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
+            },
+        );
+        kms.provision_key().unwrap();
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_transfer_psp22".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                    "to": to,
+                    "amount_base_units": "10"
+                }),
+            },
+            &kms,
+        );
+
+        assert!(!response.is_error);
+        let data = response_json(&response);
+        assert_eq!(data["amount_base_units"], "10");
+        assert_eq!(data["asset_metadata"]["symbol"], "POL");
+        assert_eq!(data["broadcasted"], false);
+        assert_eq!(kms.spent_today(), 0);
+    }
+
+    #[test]
+    fn psp22_transfer_amount_base_units_must_match_amount() {
+        let contract = lunes_address(2);
+        let to = lunes_address(3);
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_transfer_psp22".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                    "to": to,
+                    "amount": 10,
+                    "amount_base_units": "11"
+                }),
+            },
+            &AgentKms::new(AgentMode::PrepareOnly, permissions()),
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0]
+            .text
+            .contains("amount_base_units must match amount"));
     }
 
     #[test]
@@ -4321,6 +4790,7 @@ mod tests {
                 whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 100,
                 allowlist_contracts: Default::default(),
+                asset_policies: Default::default(),
                 governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
@@ -4354,6 +4824,7 @@ mod tests {
                 whitelisted_addresses: vec![contract.clone()],
                 daily_limit_lunes: 100,
                 allowlist_contracts: Default::default(),
+                asset_policies: Default::default(),
                 governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
@@ -4375,6 +4846,50 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.content[0].text.contains("PSP22::approve"));
+    }
+
+    #[test]
+    fn generic_contract_call_blocks_autonomous_psp22_transfer_bypass() {
+        let contract = lunes_address(2);
+        let to = lunes_address(3);
+        let mut allowlist_contracts = std::collections::HashMap::new();
+        allowlist_contracts.insert(contract.clone(), vec!["PSP22::transfer".into()]);
+        let mut asset_policies = std::collections::HashMap::new();
+        asset_policies.insert(
+            contract.clone(),
+            psp22_asset_policy(1_000, vec![to.clone()]),
+        );
+        let kms = AgentKms::new(
+            AgentMode::Autonomous,
+            PermissionsConfig {
+                allowed_extrinsics: vec!["contracts.call".into()],
+                whitelisted_addresses: vec![contract.clone()],
+                daily_limit_lunes: 100,
+                allowlist_contracts,
+                asset_policies,
+                governance: Default::default(),
+                ttl_hours: 168,
+                human_approval_required: true,
+                approval_message_template: None,
+            },
+        );
+        kms.provision_key().unwrap();
+
+        let response = dispatch_tool_call(
+            &ToolCallRequest {
+                name: "lunes_call_contract".into(),
+                arguments: serde_json::json!({
+                    "contract_address": contract,
+                    "message": "PSP22::transfer",
+                    "args": {"to": to, "amount_base_units": "10"},
+                    "value": 0
+                }),
+            },
+            &kms,
+        );
+
+        assert!(response.is_error);
+        assert!(response.content[0].text.contains("lunes_transfer_psp22"));
     }
 
     #[test]
@@ -4528,6 +5043,7 @@ mod tests {
                 whitelisted_addresses: vec!["staking".into(), lunes_address(8)],
                 daily_limit_lunes: 1_000,
                 allowlist_contracts: Default::default(),
+                asset_policies: Default::default(),
                 governance: Default::default(),
                 ttl_hours: 168,
                 human_approval_required: true,

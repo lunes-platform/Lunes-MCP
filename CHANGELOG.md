@@ -5,6 +5,9 @@
 - Added live Lunes Network reads for balances, account overview, validator state,
   staking account state, transaction status, and contract simulations.
 - Added asset inventory and allowlisted PSP22 balance dry-runs.
+- Added local PSP22 asset policies with metadata, recipient allowlists, and
+  per-contract base-unit transfer limits; PSP22 token amounts no longer consume
+  the native LUNES daily budget.
 - Added guarded relay for externally signed Lunes transaction payloads.
 - Added guarded native LUNES transfer submission with dynamic transaction
   construction, KMS Ed25519 signing, finality tracking, raw event lookup, dual
@@ -14,7 +17,7 @@
   broadcast, with explicit `author.submit_extrinsic` -> `broadcast` agent
   policy required.
 - Required explicit contract/message allowlists for PSP22 and generic contract
-  write preparation.
+  write preparation, and blocked autonomous generic contract-call signing.
 - Added raw event storage to transaction status responses when available.
 - Added bounded recent block summaries, raw block event lookup, and account
   activity timeline entries without returning raw extrinsics from block summary

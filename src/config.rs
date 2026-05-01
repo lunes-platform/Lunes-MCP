@@ -74,6 +74,10 @@ pub struct PermissionsConfig {
     #[serde(default)]
     pub allowlist_contracts: HashMap<String, Vec<String>>,
 
+    /// Local metadata and transfer limits for PSP22 assets, keyed by contract address.
+    #[serde(default)]
+    pub asset_policies: HashMap<String, AssetPolicyConfig>,
+
     /// Explicit prepare-only governance policy. Defaults deny every vote.
     #[serde(default)]
     pub governance: GovernancePolicyConfig,
@@ -88,6 +92,30 @@ pub struct PermissionsConfig {
 
     /// Custom template for human approval pending message.
     pub approval_message_template: Option<String>,
+}
+
+/// Local PSP22 asset policy. Metadata is advisory; limits are enforcement inputs.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct AssetPolicyConfig {
+    /// Human-readable asset name shown by MCP tools.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Asset ticker shown by MCP tools.
+    #[serde(default)]
+    pub symbol: Option<String>,
+
+    /// Decimal places used by the PSP22 asset.
+    #[serde(default)]
+    pub decimals: Option<u8>,
+
+    /// Maximum amount per transfer, expressed in PSP22 base units.
+    #[serde(default)]
+    pub max_transfer_base_units: Option<String>,
+
+    /// Recipients allowed for this asset. Empty blocks PSP22 transfers.
+    #[serde(default)]
+    pub allowed_recipients: Vec<String>,
 }
 
 /// Prepare-only governance policy. This never authorizes final voting broadcast.
@@ -191,6 +219,7 @@ pub fn default_safe_config() -> ConfigFile {
                 whitelisted_addresses: vec![],
                 daily_limit_lunes: 0,
                 allowlist_contracts: HashMap::new(),
+                asset_policies: HashMap::new(),
                 governance: GovernancePolicyConfig::default(),
                 ttl_hours: 168,
                 human_approval_required: true,
@@ -239,7 +268,7 @@ pub fn validate_runtime_config(
         .iter()
         .any(|extrinsic| extrinsic == "contracts.call")
     {
-        return Err(ConfigValidationError::ContractsCallDisabled);
+        validate_autonomous_contract_call_policy(permissions)?;
     }
 
     if let Some(extrinsic) = permissions
@@ -253,6 +282,59 @@ pub fn validate_runtime_config(
     }
 
     Ok(())
+}
+
+fn validate_autonomous_contract_call_policy(
+    permissions: &PermissionsConfig,
+) -> Result<(), ConfigValidationError> {
+    if permissions.allowlist_contracts.is_empty() {
+        return Err(ConfigValidationError::ContractsCallDisabled);
+    }
+
+    for (contract, methods) in &permissions.allowlist_contracts {
+        if methods.is_empty()
+            || methods
+                .iter()
+                .any(|method| !is_psp22_asset_method(method.as_str()))
+        {
+            return Err(ConfigValidationError::ContractsCallDisabled);
+        }
+
+        if !methods
+            .iter()
+            .any(|method| is_psp22_transfer_method(method.as_str()))
+        {
+            continue;
+        }
+
+        let Some(policy) = permissions.asset_policies.get(contract) else {
+            return Err(ConfigValidationError::ContractsCallDisabled);
+        };
+        let Some(max_transfer) = policy
+            .max_transfer_base_units
+            .as_deref()
+            .and_then(|value| value.parse::<u128>().ok())
+        else {
+            return Err(ConfigValidationError::ContractsCallDisabled);
+        };
+        if max_transfer == 0 || policy.allowed_recipients.is_empty() {
+            return Err(ConfigValidationError::ContractsCallDisabled);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_psp22_transfer_method(method: &str) -> bool {
+    method == "PSP22::transfer" || method == "transfer"
+}
+
+fn is_psp22_balance_method(method: &str) -> bool {
+    method == "PSP22::balance_of" || method == "balance_of"
+}
+
+fn is_psp22_asset_method(method: &str) -> bool {
+    is_psp22_balance_method(method) || is_psp22_transfer_method(method)
 }
 
 fn is_autonomous_high_risk_extrinsic(extrinsic: &str) -> bool {
@@ -382,7 +464,7 @@ pub enum ConfigValidationError {
     #[error("autonomous mode requires daily_limit_lunes > 0")]
     DailyLimitRequired,
 
-    #[error("autonomous contracts.call is disabled until contract message allowlists and asset-specific limits exist")]
+    #[error("autonomous contracts.call requires PSP22-only allowlists with asset-specific transfer limits and recipients")]
     ContractsCallDisabled,
 
     #[error("autonomous extrinsic '{0}' is disabled until a dedicated safe policy exists")]
@@ -424,6 +506,7 @@ ttl_hours = 48
         assert_eq!(file.agent.permissions.ttl_hours, 48);
         assert_eq!(file.agent.permissions.whitelisted_addresses.len(), 1);
         assert!(file.agent.permissions.allowlist_contracts.is_empty());
+        assert!(file.agent.permissions.asset_policies.is_empty());
         assert!(!file.agent.permissions.governance.allow_prepare_votes);
     }
 
@@ -443,6 +526,45 @@ daily_limit_lunes = 0
         let file: ConfigFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.agent.wallet.mode, AgentMode::PrepareOnly);
         assert_eq!(file.agent.permissions.ttl_hours, 168);
+    }
+
+    #[test]
+    fn test_parse_asset_policy_config() {
+        let toml_str = r#"
+[network]
+rpc_url = "wss://ws.lunes.io"
+
+[agent.wallet]
+mode = "prepare_only"
+
+[agent.permissions]
+allowed_extrinsics = ["contracts.call"]
+whitelisted_addresses = ["5ContractAddress"]
+daily_limit_lunes = 1
+
+[agent.permissions.allowlist_contracts]
+"5ContractAddress" = ["PSP22::transfer"]
+
+[agent.permissions.asset_policies."5ContractAddress"]
+name = "Policy Token"
+symbol = "POL"
+decimals = 12
+max_transfer_base_units = "1000"
+allowed_recipients = ["5RecipientAddress"]
+"#;
+        let file: ConfigFile = toml::from_str(toml_str).unwrap();
+        let policy = file
+            .agent
+            .permissions
+            .asset_policies
+            .get("5ContractAddress")
+            .unwrap();
+
+        assert_eq!(policy.name.as_deref(), Some("Policy Token"));
+        assert_eq!(policy.symbol.as_deref(), Some("POL"));
+        assert_eq!(policy.decimals, Some(12));
+        assert_eq!(policy.max_transfer_base_units.as_deref(), Some("1000"));
+        assert_eq!(policy.allowed_recipients, vec!["5RecipientAddress"]);
     }
 
     #[test]
@@ -501,6 +623,53 @@ daily_limit_lunes = 0
     #[test]
     fn autonomous_mode_disables_contracts_call_until_limits_exist() {
         let cfg = autonomous_config(vec!["contracts.call"], vec!["5GoodAddress"], 100, 168);
+
+        let err = validate_runtime_config(&cfg, true).unwrap_err();
+
+        assert!(matches!(err, ConfigValidationError::ContractsCallDisabled));
+    }
+
+    #[test]
+    fn autonomous_mode_accepts_psp22_contracts_call_with_asset_policy() {
+        let contract = "5ContractAddress";
+        let recipient = "5RecipientAddress";
+        let mut cfg = autonomous_config(vec!["contracts.call"], vec![contract], 100, 168);
+        cfg.agent.permissions.allowlist_contracts.insert(
+            contract.into(),
+            vec!["PSP22::balance_of".into(), "PSP22::transfer".into()],
+        );
+        cfg.agent.permissions.asset_policies.insert(
+            contract.into(),
+            AssetPolicyConfig {
+                name: Some("Policy Token".into()),
+                symbol: Some("POL".into()),
+                decimals: Some(12),
+                max_transfer_base_units: Some("1000".into()),
+                allowed_recipients: vec![recipient.into()],
+            },
+        );
+
+        validate_runtime_config(&cfg, true).unwrap();
+    }
+
+    #[test]
+    fn autonomous_mode_rejects_contracts_call_with_generic_message() {
+        let contract = "5ContractAddress";
+        let mut cfg = autonomous_config(vec!["contracts.call"], vec![contract], 100, 168);
+        cfg.agent
+            .permissions
+            .allowlist_contracts
+            .insert(contract.into(), vec!["PSP22::approve".into()]);
+        cfg.agent.permissions.asset_policies.insert(
+            contract.into(),
+            AssetPolicyConfig {
+                name: None,
+                symbol: None,
+                decimals: None,
+                max_transfer_base_units: Some("1000".into()),
+                allowed_recipients: vec!["5RecipientAddress".into()],
+            },
+        );
 
         let err = validate_runtime_config(&cfg, true).unwrap_err();
 
@@ -622,6 +791,7 @@ daily_limit_lunes = 0
                         .collect(),
                     daily_limit_lunes,
                     allowlist_contracts: HashMap::new(),
+                    asset_policies: HashMap::new(),
                     governance: GovernancePolicyConfig::default(),
                     ttl_hours,
                     human_approval_required: true,

@@ -65,7 +65,7 @@ The server is built to fail closed.
 - Autonomous signing requires explicit local opt-in with `LUNES_MCP_ALLOW_AUTONOMOUS=1`.
 - Broadcasting a human-signed extrinsic requires `LUNES_MCP_ENABLE_BROADCAST=1`, a pre-approved signed payload hash, `confirm_broadcast=true`, and agent policy allowing `author.submit_extrinsic` to the `broadcast` target.
 - Broadcasting an internally signed native LUNES transfer additionally requires `LUNES_MCP_ENABLE_INTERNAL_SIGNING=1`, `LUNES_MCP_AUDIT_LOG_PATH`, an active KMS key, `balances.transfer` policy for the recipient, and `author.submit_extrinsic` policy for `broadcast`.
-- Read-only contract simulation requires message-level allowlists; autonomous contract writes remain disabled until asset-specific limits are available.
+- Read-only contract simulation requires message-level allowlists; autonomous generic contract calls are blocked, and PSP22 transfers require contract/message, recipient, and asset-specific base-unit limits.
 
 ## Agent Capabilities
 
@@ -76,7 +76,7 @@ action passes through explicit server-side policy.
 | Capability | What the agent can do |
 | --- | --- |
 | Account visibility | Read native LUNES balances, nonce, spendable amount, and policy context through live Lunes Network RPC |
-| Asset visibility | List native LUNES plus allowlisted PSP22 contracts, and dry-run token balance reads through live RPC |
+| Asset visibility | List native LUNES plus allowlisted PSP22 contracts, local metadata, transfer limits, and dry-run token balance reads through live RPC |
 | Network awareness | Read live Lunes Network metadata, health, peers, finality lag, token settings, address format, and runtime version |
 | Address safety | Validate Lunes Network SS58 addresses before a transfer or contract action is prepared |
 | Transaction awareness | Check pending pool, current heads, recent finalized block summaries, raw block events, and account activity timelines |
@@ -90,7 +90,7 @@ action passes through explicit server-side policy.
 | Governance visibility | Read bounded raw referendum storage and current prepare-only governance policy |
 | Governance preparation | Prepare human-review vote and remove-vote payloads without MCP signing or broadcast |
 | Contract discovery | Look up Lunes contract interface metadata through the tooling surface |
-| Transfer preparation | Build human-reviewable payloads for native LUNES and PSP22 transfers |
+| Transfer preparation | Build human-reviewable payloads for native LUNES and policy-limited PSP22 transfers |
 | Local agent wallet lifecycle | Request creation or revocation of a local agent key |
 | Policy-bounded signing | Sign local intent payloads only when autonomous mode, allowlists, TTL, and spend limits permit it |
 | Operational visibility | Report health, status, active key state, spend usage, permissions, and audit entries |
@@ -178,6 +178,14 @@ daily_limit_lunes = 0
 allowlist_contracts = {}
 ttl_hours = 168
 
+# Optional PSP22 policy:
+# [agent.permissions.asset_policies."6contract..."]
+# name = "Example Token"
+# symbol = "EXT"
+# decimals = 12
+# max_transfer_base_units = "1000000000000"
+# allowed_recipients = ["5recipient..."]
+
 [agent.permissions.governance]
 allow_prepare_votes = false
 allowed_referenda = []
@@ -212,6 +220,29 @@ whitelisted_addresses = [
 ]
 daily_limit_lunes = 100
 ttl_hours = 168
+```
+
+For PSP22 assets, reads and transfers are separated. `allowlist_contracts`
+grants methods for a contract, while `asset_policies` supplies local metadata,
+a per-transfer token limit in base units, and the recipients allowed for that
+token. Metadata is local policy data; it is not automatic on-chain token
+metadata discovery.
+
+```toml
+[agent.permissions]
+allowed_extrinsics = ["contracts.call"]
+whitelisted_addresses = ["6psp22_contract..."]
+daily_limit_lunes = 1
+
+[agent.permissions.allowlist_contracts]
+"6psp22_contract..." = ["PSP22::balance_of", "PSP22::transfer"]
+
+[agent.permissions.asset_policies."6psp22_contract..."]
+name = "Example Token"
+symbol = "EXT"
+decimals = 12
+max_transfer_base_units = "1000000000000"
+allowed_recipients = ["5recipient..."]
 ```
 
 For governance workflows, use the dedicated prepare-only policy. This policy
@@ -461,7 +492,7 @@ use a client with HTTP MCP transport support.
 | Tool | Type | Description |
 | --- | --- | --- |
 | `lunes_get_balance` | Read | Reads native LUNES balance data or delegates allowlisted PSP22 balance checks to the asset balance tool |
-| `lunes_get_assets` | Read | Lists native LUNES and PSP22 contracts currently allowed by the local agent policy |
+| `lunes_get_assets` | Read | Lists native LUNES plus PSP22 contracts allowed by local policy, including configured metadata and transfer limits |
 | `lunes_get_asset_balance` | Read | Reads native LUNES balances or dry-runs `PSP22::balance_of` for an allowlisted contract |
 | `lunes_get_network_health` | Read | Reads live peer count, sync status, head/finality lag, pending pool size, and RPC surface size |
 | `lunes_get_account_overview` | Read | Reads account nonce, native balances, spendable amount, and active agent policy |
@@ -483,8 +514,8 @@ use a client with HTTP MCP transport support.
 | `lunes_read_contract` | Read | Simulates a read-only Lunes contract call through live RPC when allowed by contract message policy |
 | `lunes_search_contract` | Read | Looks up Lunes contract interface metadata |
 | `lunes_transfer_native` | Write | Prepares, locally signs, or guarded-broadcasts a native LUNES transfer |
-| `lunes_transfer_psp22` | Write | Prepares or signs a PSP22 transfer |
-| `lunes_call_contract` | Write | Prepares or signs a Lunes contract call |
+| `lunes_transfer_psp22` | Write | Prepares or signs a PSP22 transfer only when contract/message, recipient, and asset-specific base-unit limits pass |
+| `lunes_call_contract` | Write | Prepares a Lunes contract call; autonomous generic calls are blocked in favor of specialized policy-checked tools |
 | `lunes_stake_bond` | Write | Prepares or signs a staking bond operation |
 | `lunes_stake_unbond` | Write | Prepares or signs a staking unbond operation |
 | `lunes_stake_withdraw_unbonded` | Write | Prepares or signs withdrawal of unlocked staking funds |
